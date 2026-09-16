@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+MAIN_ROOT="$(cd "$(dirname "$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir)")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/.claude"
 touch "$TMP/.apexyard-fork"
-ln -s "$ROOT/.claude/hooks" "$TMP/.claude/hooks"
-ln -s "$ROOT/.claude/settings.json" "$TMP/.claude/settings.json"
+ln -s "$MAIN_ROOT/.claude/hooks" "$TMP/.claude/hooks"
+ln -s "$MAIN_ROOT/.claude/settings.json" "$TMP/.claude/settings.json"
 mkdir -p "$TMP/workspace/ok/.claude"
 printf '{}\n' > "$TMP/workspace/ok/.claude/settings.json"
 cat > "$TMP/registry.yaml" <<YAML
@@ -54,10 +55,25 @@ version: 1
 projects:
   - name: ok
     workspace: workspace/ok
-    adapters: []
+    adapters: [codex]
 YAML
 "$ROOT/bin/manage-portfolio-adapters.sh" --install --registry "$FIXTURE/portfolio/apexyard.projects.yaml" >/dev/null
 [ -f "$FIXTURE/portfolio/.apexyard-fork" ]
 [ -L "$FIXTURE/portfolio/.claude/hooks" ]
 [ -L "$FIXTURE/portfolio/.claude/settings.json" ]
+workspace="$FIXTURE/portfolio/workspace/ok"
+[ -f "$workspace/.codex/hooks.json" ]
+hook=$(jq -r '.hooks.PreToolUse[]?.hooks[]? | select(.command | contains("block-git-add-all.sh")) | .command' "$workspace/.codex/hooks.json")
+set +e
+printf '%s' '{"tool_name":"Bash","tool_input":{"command":"git add -A"}}' | (cd "$workspace" && bash -c "$hook") >/dev/null 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ]
+unlink "$FIXTURE/portfolio/.claude/hooks"
+ln -s "$TMP" "$FIXTURE/portfolio/.claude/hooks"
+if "$ROOT/bin/manage-portfolio-adapters.sh" --check --registry "$FIXTURE/portfolio/apexyard.projects.yaml" >"$TMP/unsafe-out" 2>&1; then
+  echo "expected unsafe hook link to fail drift check" >&2
+  exit 1
+fi
+grep -q 'unsafe hooks link target' "$TMP/unsafe-out"
 echo "PASS: split-portfolio adapter anchor"

@@ -33,6 +33,19 @@ fi
 command -v yq >/dev/null 2>&1 || { echo "ERROR: yq is required" >&2; exit 1; }
 root_dir="$(cd "$(dirname "$REGISTRY")" && pwd)"
 count=0; drift=0
+if [ "$root_dir" != "$FRAMEWORK_ROOT" ]; then
+  command -v python3 >/dev/null 2>&1 || {
+    echo "ERROR: python3 is required to create relative portfolio adapter links" >&2
+    exit 1
+  }
+fi
+
+link_resolves_to() {
+  python3 - "$1" "$2" <<'PY'
+import os, sys
+print("true" if os.path.realpath(sys.argv[1]) == os.path.realpath(sys.argv[2]) else "false")
+PY
+}
 
 ensure_split_portfolio_anchor() {
   [ "$root_dir" = "$FRAMEWORK_ROOT" ] && return 0
@@ -62,15 +75,20 @@ PY
       ln -s "$settings_target" "$settings_link"
     fi
   fi
-  [ -f "$anchor" ] || { echo "DRIFT portfolio: missing $anchor"; return 1; }
+  [ -f "$anchor" ] || { echo "DRIFT portfolio: missing $anchor (run --install to create it)"; return 1; }
   [ -L "$hooks_link" ] && [ -d "$hooks_link" ] || { echo "DRIFT portfolio: $hooks_link must link to framework hooks"; return 1; }
+  [ "$(link_resolves_to "$hooks_link" "$FRAMEWORK_ANCHOR_ROOT/.claude/hooks")" = true ] || { echo "DRIFT portfolio: unsafe hooks link target"; return 1; }
   [ -L "$settings_link" ] && [ -f "$settings_link" ] || { echo "DRIFT portfolio: $settings_link must link to framework settings"; return 1; }
+  [ "$(link_resolves_to "$settings_link" "$FRAMEWORK_ANCHOR_ROOT/.claude/settings.json")" = true ] || { echo "DRIFT portfolio: unsafe settings link target"; return 1; }
 }
 
 if ! ensure_split_portfolio_anchor; then
-  [ "$MODE" = check ] && exit 1
+  if [ "$MODE" = check ]; then
+    drift=$((drift + 1))
+  else
   echo "ERROR: unable to establish the split-portfolio ops-root anchor" >&2
   exit 1
+  fi
 fi
 
 while IFS= read -r row; do
