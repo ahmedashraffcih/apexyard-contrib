@@ -52,10 +52,11 @@ The following hooks are housekeeping hooks:
 
 They produce no output unless their own work requires it.
 
-The dispatcher removes 17 repeated wrapper shells and 17 repeated ops-root
-discoveries. It does not remove concurrent process pressure. It still starts
-the 17 remaining hooks at the same time, so the peak process count stays close
-to the previous fan-out.
+The single settings entry removes 17 repeated wrapper shells and 17 repeated
+ops-root discoveries. It does not remove concurrent process pressure. The
+dispatcher still starts the 17 remaining hooks at the same time. The peak
+process count is expected to stay close to the previous fan-out. This PR did
+not measure it.
 
 The settings fan-out falls from 18 commands to one. The PR records
 SessionStart timing against the issue baseline and verifies that Claude Code,
