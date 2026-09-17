@@ -341,7 +341,7 @@ rm -rf "$SB"
 # ---------------------------------------------------------------------------
 (
   cd "$SRC_ROOT" || exit 99
-  OPS_ROOT="$SRC_ROOT"
+  export OPS_ROOT="$SRC_ROOT"
   # shellcheck source=/dev/null
   . "$LIB_CHAIN"
   chain=$(migration_chain "v5.4.0" "v5.6.2")
