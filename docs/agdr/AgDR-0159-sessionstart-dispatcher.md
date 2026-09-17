@@ -52,6 +52,11 @@ The following hooks are housekeeping hooks:
 
 They produce no output unless their own work requires it.
 
+The dispatcher removes 17 repeated wrapper shells and 17 repeated ops-root
+discoveries. It does not remove concurrent process pressure. It still starts
+the 17 remaining hooks at the same time, so the peak process count stays close
+to the previous fan-out.
+
 The settings fan-out falls from 18 commands to one. The PR records
 SessionStart timing against the issue baseline and verifies that Claude Code,
 Cursor IDE, pi, Codex, and opencode retain their existing startup wiring. On
@@ -65,7 +70,7 @@ sequential baseline while retaining the existing hook set.
 | --- | --- |
 | One dispatcher over the existing hooks | Accepted. It removes repeated root discovery while preserving hook ownership and order. |
 | Remove or merge the individual hooks | Rejected. It would combine unrelated policy and increase regression risk. |
-| Keep the 18 wrappers and rely on harness parallelism | Rejected. It leaves repeated process startup and file-descriptor pressure in place. |
+| Keep the 18 wrappers and rely on harness parallelism | Rejected. It keeps 18 wrapper shells and repeats ops-root discovery for each hook. |
 
 ## References
 
