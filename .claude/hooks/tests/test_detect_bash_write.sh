@@ -187,6 +187,25 @@ assert_write "python open star-args"          'python3 -c "open(*args)"'
 assert_write "python tarfile extractall"      'python3 -c "import tarfile; tarfile.open(\"b.tar\").extractall(\".\")"'
 assert_write "python zipfile extractall"      'python3 -c "import zipfile; zipfile.ZipFile(\"b.zip\").extractall(\".\")"'
 
+# tarfile write modes carry a compression suffix after ":" or "|". Those
+# characters would otherwise end the mode token early and read as a read.
+assert_write "python tarfile w:gz"            'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w:gz\")"'
+assert_write "python tarfile w|gz stream"     'python3 -c "import tarfile; tarfile.open(\"out.tgz\", \"w|gz\")"'
+assert_write "python tarfile x:bz2"           'python3 -c "import tarfile; tarfile.open(\"out.tbz\", \"x:bz2\")"'
+assert_read  "python tarfile r:gz"            'python3 -c "import tarfile; tarfile.open(\"in.tgz\", \"r:gz\")"'
+
+# A mode held in a variable could be any mode. dev caught these only because a
+# realistic identifier like "path" contains an "a" — rename it and the accident
+# disappears, so match the shape instead.
+assert_write "python open, variable mode"     'python3 -c "open(path, mode)"'
+assert_write "python open, other var names"   'python3 -c "open(filename, filemode)"'
+assert_read  "python open, kwarg not a mode"  'python3 -c "print(open(p, encoding=\"utf-8\").read())"'
+
+# os.open takes integer flags rather than a mode string.
+assert_write "python os.open O_WRONLY"        'python3 -c "import os; os.open(path, os.O_WRONLY|os.O_CREAT)"'
+assert_write "python os.open O_APPEND"        'python3 -c "import os; os.open(path, os.O_APPEND)"'
+assert_read  "python os.open O_RDONLY"        'python3 -c "import os; os.open(path, os.O_RDONLY)"'
+
 # #153 — counterexamples for the new matcher families.
 assert_read  "cp --help"      "cp --help"
 assert_read  "cp --version"   "cp --version"

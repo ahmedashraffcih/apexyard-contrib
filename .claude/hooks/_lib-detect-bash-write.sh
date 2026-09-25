@@ -413,21 +413,39 @@ _bdw_match_wget_output() {
 # `open(*args)` is treated as a write: the mode is unknowable from the call
 # site, and this clause exists to gate writes.
 #
-# A non-literal mode (`open(p, m)`) is NOT matched here — the same as on `dev`.
-# Such a command is still caught whenever it goes on to call `.write(`, which
-# the neighbouring clause handles, but a bare `open(p, m)` is a known gap.
+# A mode held in a VARIABLE (`open(path, mode)`) is matched by its own clause:
+# a second argument that is a bare identifier — no quotes, no `=` — could be
+# any mode, so it is treated as a write. `dev` caught these only because a
+# realistic identifier like `path` contains an `a`; that is an accident, and
+# the accident disappears the moment the variable is renamed.
+#
+# `os.open()` takes integer flags rather than a mode string, so it needs its
+# own clause keyed on the write flags.
+#
 # The leading `.*` is intentionally greedy: over-matching this clause only
 # costs an unnecessary ticket check.
 #
 # The optional `\\?` before each quote absorbs a backslash-escaped quote. A
 # command can reach a hook still carrying its escapes — `python3 -c
 # "open(\"f\", \"w\")"` — so the mode token is delimited by `\"`, not `"`.
-_BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*\\\\?['\"]"
+# The optional `([:|]...)` tail carries tarfile's compression suffixes —
+# `'w:gz'`, `'w|bz2'`, `'x:xz'`. Those are write modes whose `:` or `|` would
+# otherwise terminate the token early and read as a read. `'r:gz'` stays a
+# read, because the leading `[wax+]` still has to match.
+_BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*([:|][a-z0-9*]*)?\\\\?['\"]"
+
+# A second argument that is a bare identifier — no quotes, no `=` — is a mode
+# held in a variable. It could be any mode, so it counts as a write.
+_BDW_PY_VARMODE="\bopen\([^,)]*,[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[,)]"
+
+# `os.open()` takes integer flags, not a mode string. These are its write flags.
+_BDW_PY_OSOPEN="\bos\.open\([^)]*O_(WRONLY|RDWR|CREAT|APPEND|TRUNC)"
+
 # `.extractall(` covers tarfile and zipfile extraction, both of which write
 # files. `dev` caught the tarfile form only because every `.tar` path contains
 # the letter `a`; it never caught the zipfile form at all. Matching the
 # extraction call itself is what the shell-side `tar -x` matcher already does.
-_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
+_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_OSOPEN}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
 
 # 9. Embedded Python (-c) with write keywords. Extended in #153 to include
 #    pathlib touch, shutil copy*/move, os.rename.
