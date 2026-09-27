@@ -268,31 +268,42 @@ run_case "#1363: non-string allowlist entries are ignored, not fatal" \
 echo
 echo "Case 9b: shipped defaults allowlist covers every shipped override-only key"
 SHIPPED_DEFAULTS="$(cd "$(dirname "$0")/../.." && pwd)/project-config.defaults.json"
-SB9=$(mktemp -d)
-SB9=$(cd "$SB9" && pwd -P)
-cat > "$SB9/overrides.json" <<'JSON'
-{
-  "migration_paths": ["db/migrations/**"],
-  "migration_label": "migration",
-  "ui_paths": ["^src/ui/"],
-  "ui_paths_exclude": ["^docs/examples/"],
-  "design_paths": ["^docs/designs/"],
-  "design_paths_exclude": ["^docs/samples/"],
-  "architecture_paths": ["^infra/"]
-}
-JSON
-# shellcheck source=/dev/null
-. "$LIB_SRC"
-out9=$(detect_deprecated_config_keys "$SHIPPED_DEFAULTS" "$SB9/overrides.json")
-if [ -z "$out9" ]; then
+HOOKS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Derive the key set by SCANNING the hooks rather than restating it here. A
+# fixed list can only show that a declared key stays declared; it cannot notice
+# a hook that starts reading a NEW override-only key. That is exactly how
+# `tracker_repo` reached `dev` undeclared while this case kept passing.
+#
+# The signal is a hook reading the OVERRIDE file directly — a `jq '.key'`
+# against `project-config.json`. Keys read through `config_get` come from the
+# merged document and are declared in the defaults, so they are not at issue.
+scanned_keys=$(grep -hE "jq[^|]*project-config\.json" "$HOOKS_DIR"/*.sh 2>/dev/null \
+  | grep -oE "'\.[a-zA-Z_][a-zA-Z0-9_]*" | sed "s/'\.//" | sort -u)
+
+undeclared=""
+for k in $scanned_keys; do
+  in_defaults=$(jq --arg k "$k" 'has($k)' "$SHIPPED_DEFAULTS")
+  in_allowlist=$(jq --arg k "$k" '(._override_only_keys // []) | index($k) != null' "$SHIPPED_DEFAULTS")
+  if [ "$in_defaults" = "false" ] && [ "$in_allowlist" = "false" ]; then
+    undeclared="$undeclared $k"
+  fi
+done
+
+# An empty scan would make this case pass vacuously, so treat it as a failure:
+# it means the read idiom this grep models has changed.
+if [ -z "$scanned_keys" ]; then
+  FAIL=$((FAIL + 1))
+  FAILED_CASES="$FAILED_CASES\n  - Case 9b scan matched no config reads; the grepped idiom has changed"
+  echo "FAIL: scan matched no keys — the grepped read idiom has changed"
+elif [ -z "$undeclared" ]; then
   PASS=$((PASS + 1))
-  echo "PASS: shipped defaults allowlist covers every shipped override-only key"
+  echo "PASS: every override-only key a hook reads is declared ($(echo "$scanned_keys" | tr '\n' ' '))"
 else
   FAIL=$((FAIL + 1))
-  FAILED_CASES="$FAILED_CASES\n  - shipped allowlist missing key(s): $(echo "$out9" | tr '\n' ' ')"
-  echo "FAIL: shipped allowlist missing: $(echo "$out9" | tr '\n' ' ')"
+  FAILED_CASES="$FAILED_CASES\n  - hook reads undeclared config key(s):$undeclared"
+  echo "FAIL: hook reads undeclared config key(s):$undeclared"
 fi
-rm -rf "$SB9"
 
 echo
 echo "Case 8: no reserved jq keyword used as a binding name"

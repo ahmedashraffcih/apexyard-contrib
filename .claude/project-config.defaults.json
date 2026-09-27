@@ -10,7 +10,8 @@
     "ui_paths_exclude",
     "design_paths",
     "design_paths_exclude",
-    "architecture_paths"
+    "architecture_paths",
+    "tracker_repo"
   ],
 
   "ticket": {
