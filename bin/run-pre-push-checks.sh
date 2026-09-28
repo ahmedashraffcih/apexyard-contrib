@@ -165,10 +165,19 @@ echo "pre-push checks:" >&2
 #
 # The version is pinned (#1367). Without a pin, npx resolves the package to
 # whatever is latest at that moment, so a new rule in an upstream release turns
-# a green gate red with no change on the adopter's side. 0.23.1 is the version
-# bundled by markdownlint-cli2-action v24.1.0, which .github/workflows/
-# markdown-lint.yml pins — so local pre-push and CI now judge by the same
-# ruleset. Bump both together, deliberately, like any other dependency.
+# a green gate red with no change on the adopter's side.
+#
+# The pin tracks CI. 0.23.1 is the markdownlint-cli2 bundled by
+# markdownlint-cli2-action at the tag recorded below, which
+# .github/workflows/markdown-lint.yml pins — so local pre-push and CI judge by
+# the same ruleset.
+#
+# Dependabot bumps that action weekly and does not read prose, so the tag is
+# recorded here as data rather than as a comment telling a human to remember.
+# test_pre_push_markdownlint_batch.sh compares it against the tag in the
+# workflow and fails when they diverge, which turns the Dependabot PR red until
+# someone updates this pin deliberately.
+MARKDOWNLINT_ACTION_TAG="v24.1.0"   # markdownlint-cli2-action tag this pin belongs to
 MARKDOWNLINT_CMD="command -v npx >/dev/null 2>&1 || { echo 'INFO: npx not found — markdownlint check skipped. Install Node.js (https://nodejs.org) to enable it locally.'; exit 0; }; md_files=\$(git ls-files '*.md' 2>/dev/null); [ -z \"\$md_files\" ] && { echo 'INFO: no tracked markdown files found — markdownlint check skipped.'; exit 0; }; echo \"\$md_files\" | tr '\\n' '\\0' | xargs -0 -s 7000 npx --yes markdownlint-cli2@0.23.1 2>&1"
 run_check "markdownlint" "$MARKDOWNLINT_CMD" || true
 

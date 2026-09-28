@@ -45,10 +45,39 @@ fi
 # so an upstream release can turn a green gate red with no local change.
 # Anchored on the npx invocation so prose mentioning the tool doesn't match;
 # fires when the package name there is NOT followed by `@<version>`.
-if ! grep -Eq 'npx[[:space:]]+--yes[[:space:]]+markdownlint-cli2[^@]' "$SCRIPT" "$EXAMPLE"; then
+if ! grep -Eq 'npx[[:space:]]+-(-yes|y)[[:space:]]+markdownlint-cli2[^@]' "$SCRIPT" "$EXAMPLE"; then
   ok "markdownlint-version-pinned"
 else
   bad "markdownlint-version-pinned" "markdownlint-cli2 is invoked without an @version pin"
+fi
+
+# The two copies of the command must pin the SAME version. Asserting only that
+# an `@` follows the package name lets them drift apart silently: the runner
+# could say @0.99.0 while the example says @0.23.1 and every check still
+# passes. Compare the extracted values, not the shape.
+runner_pin=$(grep -oE 'markdownlint-cli2@[0-9]+\.[0-9]+\.[0-9]+' "$SCRIPT" | head -1 | cut -d@ -f2)
+example_pin=$(grep -oE 'markdownlint-cli2@[0-9]+\.[0-9]+\.[0-9]+' "$EXAMPLE" | head -1 | cut -d@ -f2)
+if [ -n "$runner_pin" ] && [ "$runner_pin" = "$example_pin" ]; then
+  ok "markdownlint-pin-parity ($runner_pin)"
+else
+  bad "markdownlint-pin-parity" "runner pins '${runner_pin:-none}', example pins '${example_pin:-none}'"
+fi
+
+# The pin tracks the markdownlint-cli2 bundled by markdownlint-cli2-action.
+# Dependabot bumps that action weekly against `dev`, and nothing else would
+# notice: after a bump, CI runs a newer ruleset than the local gate, which is
+# the reverse of the defect #1367 reports. The runner records the tag its pin
+# belongs to; this compares it with the tag the workflow actually uses, so a
+# Dependabot PR fails here until someone updates the pin deliberately.
+WORKFLOW="$ROOT/.github/workflows/markdown-lint.yml"
+recorded_tag=$(grep -oE 'MARKDOWNLINT_ACTION_TAG="[^"]+"' "$SCRIPT" | head -1 | cut -d'"' -f2)
+workflow_tag=$(grep -E 'uses:.*markdownlint-cli2-action@' "$WORKFLOW" | grep -oE '#[[:space:]]*v[0-9]+\.[0-9]+\.[0-9]+' | grep -oE 'v[0-9.]+' | head -1)
+if [ -z "$recorded_tag" ] || [ -z "$workflow_tag" ]; then
+  bad "markdownlint-action-tag-parity" "could not read a tag (recorded='${recorded_tag:-none}', workflow='${workflow_tag:-none}')"
+elif [ "$recorded_tag" = "$workflow_tag" ]; then
+  ok "markdownlint-action-tag-parity ($recorded_tag)"
+else
+  bad "markdownlint-action-tag-parity" "runner records '$recorded_tag', workflow pins '$workflow_tag' — update the markdownlint-cli2 pin to the version that tag bundles"
 fi
 
 echo "${PASS} passed, ${FAIL} failed"
