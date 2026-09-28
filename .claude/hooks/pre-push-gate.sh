@@ -1,41 +1,100 @@
 #!/bin/bash
-# pre-push-gate.sh — blocks `git push` on red local checks.
+# pre-push-gate.sh — advisory reminder for local pre-push checks.
 #
-# Upgraded from an advisory reminder (pre-#111) to a blocking check-runner:
-# reads a list of shell commands from `.claude/project-config.*.json`
-# (`.pre_push.commands`) and runs them in sequence before the push is
-# allowed through. Non-zero exit from any command blocks the push.
+# REDESIGNED (me2resh/apexyard#1366, AgDR-0173). This hook used to pick a
+# target repository out of the Bash command's TEXT (a `cd` prefix, a
+# `-C` flag, or the session's own working directory), read that repo's
+# `.pre_push.commands`, and run them itself. Every shape of that parsing
+# was exploitable: PR #1405 spent four review rounds narrowing it and
+# never closed it. Hakim's H1 finding on that PR's last commit still
+# reproduced with a heredoc body, a quoted separator, a commit message,
+# and an echo — read-only text that only MENTIONS a push could make the
+# gate run a repository's declared commands before any permission
+# prompt. See that PR's closing comment and AgDR-0104 ("command-text
+# parsing cannot be made sound").
 #
-# This implements the HARD STOP documented in `.claude/rules/pr-workflow.md`
-# — "Never push without running CI checks locally." Previously the rule
-# was self-discipline; now it's mechanical.
+# This hook now NEVER executes a repository's commands and NEVER blocks.
+# The real check moved to the git-native layer:
 #
-# Silent pass conditions (exit 0, no output):
-#   - Not a `git push` command.
-#   - No `.claude/project-config.defaults.json` AND no `package.json` in the
-#     repo → treat as a non-runnable repo (docs-only, newly-forked, etc.).
-#   - HEAD commit subject contains the skip marker `<!-- pre-push: skip -->`
-#     → emergency escape hatch; prints a visible WARN and lets the push
-#     through. Leaves a grep-able trace so bypasses are auditable.
+#   .githooks/pre-push -> bin/run-configured-pre-push-checks.sh
 #
-# Configured commands (example, from the shipped defaults):
-#   - lint:      npm run lint
-#   - typecheck: npm run typecheck
-#   - test:      npm run test
-#   - build:     npm run build
+# A git `pre-push` hook receives its working directory from git itself —
+# the repository actually being pushed, always, by construction. There is
+# no command text to parse there, so H1 (a read-only command running a
+# repo's commands), H3 (a crafted command steering the check to a clean
+# repo), and L2 (some push shapes skipping the Claude-layer hooks) from
+# PR #1405's review all stop applying: none of them describe a way to
+# fool git about its own working directory.
 #
-# Skip marker: include the literal string `<!-- pre-push: skip -->` in the
-# HEAD commit message (subject or body) to bypass for that one push.
-# The hook prints the bypassed command set to stderr so the skip is visible.
+# This hook's only remaining job is a reminder about the SESSION's OWN
+# working-directory repo. It never reasons about a different repository
+# a push might target (a sibling checkout, a `workspace/<name>/` clone).
+# It names the repo it checked, every time, so the scope is never
+# ambiguous (PR #1428 review, Rex finding B1).
+#
+# MAINTAINER DECISION (PR #1428 round 2): ApexYard runs configured local
+# pre-push commands only inside an ApexYard fork that has installed the
+# git-native hook. A managed-project clone gets NO local pre-push checks
+# from ApexYard, ever — that clone's own CI is its backstop. This matches
+# AgDR-0115, which already forbids ApexYard from setting `core.hooksPath`
+# in a managed clone. So this hook never suggests that install in a repo
+# that is not an ApexYard fork (PR #1428 review, Rex finding B2) — doing
+# so would point an operator at wiring AgDR-0115 already rejected, and a
+# managed repo that ships its own `.githooks/` would get ITS OWN scripts
+# executed if the operator followed that advice (the #1087 HIGH-1 hazard
+# `.claude/skills/handover/SKILL.md` already documents for a related
+# case).
+#
+# So this hook checks two things about ONLY the session's own
+# working-directory repo, never the command text:
+#   1. Is this repo THE ops root — the actual ApexYard fork, not merely
+#      a repo that ships fork-shaped files? Resolved via the pin-first
+#      `resolve_ops_root` from `_lib-ops-root.sh`, the same resolver the
+#      rest of the framework trusts for this question. A managed repo
+#      can ship its own `.apexyard-fork` marker, or a copy of
+#      `.githooks/pre-push` plus `bin/install-git-hooks.sh` — none of
+#      that makes it the fork (Hakim finding A5, Rex finding S1, PR
+#      #1428 review). Trusting a candidate's own files here would let a
+#      managed repo talk this hook into recommending `core.hooksPath`
+#      for itself, exactly the AgDR-0115 violation this hook exists to
+#      avoid. If `resolve_ops_root` cannot resolve anything, this hook
+#      treats the repo as NOT the ops root — it never suggests the
+#      install advice on an unresolved guess.
+#   2. If it is the ops root, has it installed the git-native hook?
+#
+# It reads nothing but that repo's own files, `git config`, and the pin
+# / walk-up `resolve_ops_root` already uses — never the command text —
+# so it has nothing left to get wrong about "which repo." Before this
+# redesign, the Claude-layer gate ran a repository's commands itself,
+# sometimes against the wrong repo (#1366). After it, only the fork's
+# git-native hook runs them, and only inside the real fork.
+#
+# Install the git-native hook once per ApexYard-fork clone:
+#   git config core.hooksPath .githooks
+#   (or: bash bin/install-git-hooks.sh)
+#
+# See docs/agdr/AgDR-0173-git-native-pre-push-command-execution.md.
+
+HOOK_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd -P)"
 
 INPUT=$(cat)
-COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty' 2>/dev/null)
+COMMAND=""
+if command -v jq >/dev/null 2>&1; then
+  COMMAND=$(jq -r '.tool_input.command // empty' <<<"$INPUT" 2>/dev/null) || COMMAND=""
+fi
+if [ "$COMMAND" = "null" ]; then
+  COMMAND=""
+fi
 
 if [ -z "$COMMAND" ]; then
   exit 0
 fi
 
-if ! echo "$COMMAND" | grep -qE '\bgit\s+push\b'; then
+# A loose, best-effort check used ONLY to decide whether to print a
+# reminder. This hook runs no commands and blocks nothing, so a false
+# match here costs one extra reminder line, never a security decision —
+# unlike the pre-#1366 version, precision does not matter for safety.
+if ! printf '%s' "$COMMAND" | grep -qE '\bgit[[:space:]]+push\b'; then
   exit 0
 fi
 
@@ -45,104 +104,61 @@ if [ -z "$REPO_ROOT" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Skip marker — check HEAD commit message for the escape hatch.
+# Has this repo installed the git-native hook? If so, it will run when git
+# itself executes the push — correctly scoped no matter what the Bash
+# command looked like — so no reminder is needed.
 # ---------------------------------------------------------------------------
 
-SKIP_MARKER='<!-- pre-push: skip -->'
-HEAD_MSG=$(cd "$REPO_ROOT" && git log -1 --format='%B' 2>/dev/null)
-# -x: whole-line match only, so prose that mentions the marker inline
-# (e.g. a commit that documents the escape hatch) does not trigger it —
-# only a line consisting of exactly the marker does. See #1097.
-if printf '%s\n' "$HEAD_MSG" | grep -qxF -- "$SKIP_MARKER"; then
-  echo "WARN: pre-push gate bypassed by skip marker in HEAD commit message." >&2
-  echo "      Skipped commands will run in CI regardless — fix broken state before merging." >&2
-  exit 0
+HOOKS_PATH=$(git -C "$REPO_ROOT" config --get core.hooksPath 2>/dev/null)
+if [ -n "$HOOKS_PATH" ]; then
+  case "$HOOKS_PATH" in
+    /*) HOOK_FILE="$HOOKS_PATH/pre-push" ;;
+    *) HOOK_FILE="$REPO_ROOT/$HOOKS_PATH/pre-push" ;;
+  esac
+  if [ -f "$HOOK_FILE" ] && [ -x "$HOOK_FILE" ]; then
+    exit 0
+  fi
 fi
 
 # ---------------------------------------------------------------------------
-# Load command list from project config via the shared reader.
-# Shipped defaults ship at .claude/project-config.defaults.json.
-# See docs/project-config.md and apexyard#109.
+# Is this repo THE resolved ops root — the actual ApexYard fork? Only
+# that repo gets the install advice. Every other repo, including one
+# that ships fork-shaped files of its own, gets a short scope note
+# instead — never the `core.hooksPath` suggestion AgDR-0115 forbids for
+# that case (Hakim A5, Rex S1). Resolution is pin-first, via the same
+# `resolve_ops_root` the rest of the framework trusts for this question,
+# not a self-reported marker file this repo could ship on its own.
 # ---------------------------------------------------------------------------
 
-CMDS_JSON=""
-if [ -f "$REPO_ROOT/.claude/hooks/_lib-read-config.sh" ]; then
+IS_APEXYARD_FORK=0
+if [ -f "$HOOK_DIR/_lib-ops-root.sh" ]; then
   # shellcheck disable=SC1090,SC1091
-  . "$REPO_ROOT/.claude/hooks/_lib-read-config.sh"
-  # Produce a JSON array of {name, run} objects.
-  CMDS_JSON=$(config_get '.pre_push.commands' 2>/dev/null)
+  . "$HOOK_DIR/_lib-ops-root.sh"
+  if command -v resolve_ops_root >/dev/null 2>&1; then
+    OPS_ROOT=$(resolve_ops_root "$REPO_ROOT")
+    if [ -n "$OPS_ROOT" ] && [ "$OPS_ROOT" = "$REPO_ROOT" ]; then
+      IS_APEXYARD_FORK=1
+    fi
+  fi
 fi
 
-# Check that the config actually contains commands. Silent skip if not —
-# the hook is a no-op on repos that haven't configured any (docs-only
-# repos, newly forked skeletons, the apexyard framework repo itself before
-# it configures its own CI in a separate ticket).
-if [ -z "$CMDS_JSON" ] || [ "$CMDS_JSON" = "null" ] || [ "$CMDS_JSON" = "[]" ]; then
+if [ "$IS_APEXYARD_FORK" != "1" ]; then
+  echo "NOTE: this session's working-directory repo ($REPO_ROOT) is not an ApexYard fork. This check covers only that repo. ApexYard runs no local pre-push checks here — this repo's own CI is the backstop." >&2
   exit 0
 fi
 
-# ---------------------------------------------------------------------------
-# Run each command. On first non-zero, block with a summary.
-# ---------------------------------------------------------------------------
+cat >&2 <<MSG
+NOTE: this session's working-directory repo ($REPO_ROOT) is an ApexYard
+fork that has not installed the git-native pre-push hook. This check
+covers only that repo, not a different repository this push might
+target. Configured .pre_push.commands run only through that hook, not
+through this Claude Code check.
 
-cd "$REPO_ROOT" || exit 0
+Install it once per clone:
+  git config core.hooksPath .githooks
+  (or: bash bin/install-git-hooks.sh)
 
-FAILURES=""
-# printf '%s', NOT echo: CMDS_JSON comes from config_get and may carry a JSON
-# backslash escape (the markdownlint `tr '\n' '\0'` command). echo would mangle
-# it under an escape-interpreting shell, zeroing NUM_CMDS and silently skipping
-# every pre-push check. Same bug class as #629. See #631.
-NUM_CMDS=$(printf '%s' "$CMDS_JSON" | jq 'length' 2>/dev/null)
-if [ -z "$NUM_CMDS" ] || [ "$NUM_CMDS" = "null" ]; then
-  exit 0
-fi
-
-i=0
-while [ "$i" -lt "$NUM_CMDS" ]; do
-  NAME=$(printf '%s' "$CMDS_JSON" | jq -r ".[$i].name // \"step-$i\"" 2>/dev/null)
-  RUN=$(printf '%s' "$CMDS_JSON" | jq -r ".[$i].run // empty" 2>/dev/null)
-  i=$((i + 1))
-
-  if [ -z "$RUN" ]; then
-    continue
-  fi
-
-  # Run each command capturing last 20 lines for the error report.
-  TMP_LOG=$(mktemp -t pre-push-gate.XXXXXX)
-  if bash -c "$RUN" >"$TMP_LOG" 2>&1; then
-    rm -f "$TMP_LOG"
-    continue
-  fi
-
-  # Command failed — accumulate a summary. Keep the log for the final
-  # block message; clean up after we print.
-  TAIL=$(tail -20 "$TMP_LOG" 2>/dev/null)
-  rm -f "$TMP_LOG"
-
-  FAILURES="${FAILURES}${NAME}: FAILED
-  command: ${RUN}
-  last 20 lines of output:
-${TAIL}
-
-"
-  # Fail-fast: don't keep running subsequent commands once one has failed.
-  # (Parallel execution is a follow-up — ticket notes it as a P2 polish.)
-  break
-done
-
-if [ -n "$FAILURES" ]; then
-  cat >&2 <<MSG
-BLOCKED: pre-push-gate detected failing check(s). Fix before pushing.
-
-${FAILURES}
-To override for a genuine emergency (the fix will run in CI regardless):
-  git commit --amend -m "\$(git log -1 --format=%B)
-  ${SKIP_MARKER}"
-
-The skip marker is grep-able on purpose — bypasses should be rare and
-auditable. See .claude/rules/pr-workflow.md "Before git push (HARD STOP)".
+Until then, CI is the only backstop for .pre_push.commands on this
+clone. See .claude/rules/git-conventions.md and AgDR-0173.
 MSG
-  exit 2
-fi
-
 exit 0
