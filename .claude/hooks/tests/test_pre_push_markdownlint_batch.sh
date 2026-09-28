@@ -80,5 +80,16 @@ else
   bad "markdownlint-action-tag-parity" "runner records '$recorded_tag', workflow pins '$workflow_tag' — update the markdownlint-cli2 pin to the version that tag bundles"
 fi
 
+# CONTRIBUTING.md tells a contributor to run the same tool by hand, and says it
+# is "the same pin as the gate". The two assertions above do not read that copy,
+# so it can drift and the claim become false while every check passes.
+CONTRIBUTING="$ROOT/CONTRIBUTING.md"
+doc_pin=$(grep -oE 'markdownlint-cli2@[0-9]+\.[0-9]+\.[0-9]+' "$CONTRIBUTING" | head -1 | cut -d@ -f2)
+if [ -n "$doc_pin" ] && [ "$doc_pin" = "$runner_pin" ]; then
+  ok "markdownlint-contributing-pin-parity ($doc_pin)"
+else
+  bad "markdownlint-contributing-pin-parity" "CONTRIBUTING.md pins '${doc_pin:-none}', runner pins '${runner_pin:-none}'"
+fi
+
 echo "${PASS} passed, ${FAIL} failed"
 [ "$FAIL" -eq 0 ]
