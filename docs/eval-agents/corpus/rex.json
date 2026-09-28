@@ -203,6 +203,31 @@
         "was_justified": true
       },
       "notes": "Found while growing the corpus for me2resh/apexyard#861; matches Spike #825 row R19 (GOOD_CLEAN, 'isolated-builds rule; wiring guard passes; correct'), not previously promoted into the JSON corpus. One non-blocking nit noted (narrower destructive-git regex coverage, explicitly out of scope), consistent with the empty ground_truth_defects set."
+    },
+    {
+      "id": "rex-1289-9382269f",
+      "pr": 1289,
+      "repo": "me2resh/apexyard",
+      "commit": "9382269f",
+      "diff_range": "9382269f~1..9382269f",
+      "oracle": {
+        "source": "independent_review",
+        "established_by": "Hakim's review of the identical commit, submitted one minute after Rex's approval, recorded Gate & Trust-Chain Integrity as Fail and reproduced the defect at the reviewed commit. The fix landed in the next commit (e5a8182e), where both agents then approved.",
+        "reference": "me2resh/apexyard#1289"
+      },
+      "ground_truth_defects": [
+        {
+          "id": "D1",
+          "description": "The manager defaults an omitted `adapters` key to all four third-party adapters, cursor included. In install mode the cursor branch calls `install-cursor-adapter.sh --root \"$project_root\"`, but that installer treats `--root` as the ApexYard framework root and executes `$ROOT/bin/sync-cursor-adapter.sh` from it. A managed project workspace shipping its own `bin/sync-cursor-adapter.sh` therefore has that script executed by the portfolio manager: project-controlled code runs as framework code, breaking the trust chain. The defect is an interaction between this commit's default-adapter handling and the installer's pre-existing `--root` semantics, so it is not visible in the changed lines alone.",
+          "severity": "HIGH",
+          "location": "bin/manage-portfolio-adapters.sh"
+        }
+      ],
+      "recorded_verdict": {
+        "verdict": "APPROVED",
+        "was_justified": false
+      },
+      "notes": "Rex approved at 23:13 with 'next action: merge only after the normal human merge approval'; Hakim reported the HIGH trust-chain break on the identical commit at 23:14. Two properties make this a useful entry. First, the oracle is unusually strong: Hakim did not infer the defect but reproduced it, reporting that a workspace carrying its own bin/sync-cursor-adapter.sh printed 'project sync-cursor-adapter executed' from install mode. Second, the reviewed commit is two lines (+1 in the manager, +1/-1 in docs) and the defect lives in the interaction between that default and `bin/install-cursor-adapter.sh`, which is not in this diff — so the entry tests whether the agent reasons past the changed lines into the code path they activate. Surfaced while adjudicating candidates for me2resh/apexyard#1440."
     }
   ]
 }
