@@ -203,14 +203,6 @@ fi
 rm -rf "$SB7"
 
 # ---------------------------------------------------------------------------
-# Case 8: no jq binding (--arg / --argjson / --slurpfile / --rawfile) in the
-# helper uses a reserved jq keyword as its variable name (regression for
-# me2resh/apexyard#668). `def` et al. are grammar keywords; jq 1.6 rejects
-# them as variable names with a parse error, while jq 1.8+ is lenient — so a
-# behavioural test on a modern jq can't catch this. A static grep can, on any
-# jq version.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Case 9 (#1363): override-only keys are live config, not deprecated config.
 #
 # Some supported keys are absent from the defaults file by design — the hook
@@ -275,14 +267,30 @@ HOOKS_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # a hook that starts reading a NEW override-only key. That is exactly how
 # `tracker_repo` reached `dev` undeclared while this case kept passing.
 #
-# The signal is a hook reading the OVERRIDE file directly — a `jq '.key'`
-# against `project-config.json`. Keys read through `config_get` come from the
-# merged document and are declared in the defaults, so they are not at issue.
-scanned_keys=$(grep -hE "jq[^|]*project-config\.json" "$HOOKS_DIR"/*.sh 2>/dev/null \
+# The signal is a hook reading the OVERRIDE file directly. Two shapes carry it:
+# the file named inline, and the file held in `$PCONFIG`. The filter itself
+# very often contains a pipe — `jq -r '.design_paths // [] | join("|")'` — so
+# the expression between `jq` and the file name must not exclude `|`. An
+# earlier form here did, and matched only the one key whose read has no pipe.
+#
+# Comment lines are dropped first: several hooks document their own keys in a
+# header block, and those mentions are not reads.
+scanned_keys=$(grep -hE "jq .*(project-config\.json|PCONFIG)" "$HOOKS_DIR"/*.sh 2>/dev/null \
+  | grep -v '^[[:space:]]*#' \
   | grep -oE "'\.[a-zA-Z_][a-zA-Z0-9_]*" | sed "s/'\.//" | sort -u)
 
+# Keys a hook reads ONLY for backward compatibility. They are deliberately not
+# allowlisted, because `/update` SHOULD still offer to remove them — they are
+# dead config that the hook tolerates rather than supported configuration.
+#   commit_types — validate-commit-format.sh:347, the legacy flat key that the
+#                  nested `commit.types` block replaced.
+scan_exceptions=" commit_types "
+
 undeclared=""
+checked_keys=""
 for k in $scanned_keys; do
+  case "$scan_exceptions" in *" $k "*) continue ;; esac
+  checked_keys="$checked_keys $k"
   in_defaults=$(jq --arg k "$k" 'has($k)' "$SHIPPED_DEFAULTS")
   in_allowlist=$(jq --arg k "$k" '(._override_only_keys // []) | index($k) != null' "$SHIPPED_DEFAULTS")
   if [ "$in_defaults" = "false" ] && [ "$in_allowlist" = "false" ]; then
@@ -298,13 +306,21 @@ if [ -z "$scanned_keys" ]; then
   echo "FAIL: scan matched no keys — the grepped read idiom has changed"
 elif [ -z "$undeclared" ]; then
   PASS=$((PASS + 1))
-  echo "PASS: every override-only key a hook reads is declared ($(echo "$scanned_keys" | tr '\n' ' '))"
+  echo "PASS: every override-only key a hook reads is declared —$checked_keys"
 else
   FAIL=$((FAIL + 1))
   FAILED_CASES="$FAILED_CASES\n  - hook reads undeclared config key(s):$undeclared"
   echo "FAIL: hook reads undeclared config key(s):$undeclared"
 fi
 
+# ---------------------------------------------------------------------------
+# Case 8: no jq binding (--arg / --argjson / --slurpfile / --rawfile) in the
+# helper uses a reserved jq keyword as its variable name (regression for
+# me2resh/apexyard#668). `def` et al. are grammar keywords; jq 1.6 rejects
+# them as variable names with a parse error, while jq 1.8+ is lenient — so a
+# behavioural test on a modern jq can't catch this. A static grep can, on any
+# jq version.
+# ---------------------------------------------------------------------------
 echo
 echo "Case 8: no reserved jq keyword used as a binding name"
 # jq grammar keywords that are invalid as $-variable names.

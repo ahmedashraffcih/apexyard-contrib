@@ -36,9 +36,11 @@ This follows AgDR-0104's reasoning at a smaller scale: enumerating instances doe
 
 ## Consequences
 
-- A hook that starts reading a new override-only key fails `test_detect_deprecated_config.sh` until the key is declared.
-- The test reports the key set it scanned, so a reviewer can see what it actually examined.
-- The scan models one idiom. A hook reading the override file another way is invisible to it, which the vacuous-match guard surfaces only if *every* match disappears, not if one read is missed. That residual is accepted and recorded here.
+- A hook that starts reading a new override-only key fails `test_detect_deprecated_config.sh` until the key is declared. Verified by mutation: removing any one of the eight allowlisted keys fails the case.
+- The test reports the key set it checked, so a reviewer can see what it actually examined.
+- The scan must match the file named inline **and** the file held in `$PCONFIG`, and it must not exclude a pipe between `jq` and the file name — the filter itself usually contains one, as in `jq -r '.design_paths // [] | join("|")'`. A first version of this scan excluded pipes, so it matched only the single key whose read has none. Seven keys went unpinned while the case still passed. That is recorded because the failure is silent: a scan that finds too little looks exactly like a scan that finds nothing wrong.
+- A key read only for backward compatibility is named in a commented exception rather than allowlisted, because `/update` should still offer to remove it. `commit_types` is the only such key today.
+- The scan still models a read idiom. A hook reading the override file some other way stays invisible to it, and the vacuous-match guard only catches the case where *every* match disappears. That residual is accepted.
 - `tracker_repo` is no longer offered for deletion, so `validate-pr-create.sh` and `verify-commit-refs.sh` keep resolving the configured tracker repository.
 
 ## Artifacts
