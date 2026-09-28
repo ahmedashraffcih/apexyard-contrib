@@ -267,8 +267,51 @@ if [ -z "$PR_TYPES" ]; then
   PR_TYPES="feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert|release|spike|sync"
 fi
 
+# External contributions (#1448): a PR aimed at a repository the adopter
+# contributes to but does NOT govern. Such a repository has its own
+# CONTRIBUTING.md and its own tracker, so imposing this framework's title
+# convention on it refuses a PR that is correct for its destination.
+#
+# Opt-in and repo-scoped: `.external_contributions[]` in project-config, the
+# same shape leak-protection uses for its public-framework-repo list.
+#
+# The registry WINS. If the target is a managed project, the exemption does
+# not apply however the list is written — otherwise adding a governed repo to
+# this list would quietly disable title validation for work the framework is
+# supposed to be governing, which is a gate relaxation dressed up as config.
+EXTERNAL_TARGET=""
+if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
+  _vpc_repo_lc=$(printf '%s' "$CMD_REPO" | tr '[:upper:]' '[:lower:]')
+  _vpc_registry=""
+  if [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$HOOK_DIR/_lib-portfolio-paths.sh"
+    _vpc_registry=$(portfolio_registry 2>/dev/null)
+  fi
+  _vpc_governed=""
+  if [ -n "$_vpc_registry" ] && [ -f "$_vpc_registry" ]; then
+    if grep -qiE "^[[:space:]]*-?[[:space:]]*(repo:[[:space:]]*|- )[\"']?${_vpc_repo_lc}[\"']?[[:space:]]*$" "$_vpc_registry" 2>/dev/null; then
+      _vpc_governed="1"
+    fi
+  fi
+  if [ -z "$_vpc_governed" ]; then
+    while IFS= read -r _vpc_listed; do
+      [ -n "$_vpc_listed" ] || continue
+      _vpc_listed=$(printf '%s' "$_vpc_listed" | tr '[:upper:]' '[:lower:]')
+      if [ "$_vpc_listed" = "$_vpc_repo_lc" ]; then
+        EXTERNAL_TARGET="1"
+        break
+      fi
+    done <<EOF
+$(config_get '.external_contributions[]' 2>/dev/null)
+EOF
+  fi
+fi
+
 TICKET_REF=""
-if [ -n "$TITLE" ]; then
+if [ -n "$EXTERNAL_TARGET" ]; then
+  echo "NOTE: validate-pr-create.sh: ${CMD_REPO} is listed in .external_contributions — this framework's PR-title convention is not applied. Follow that project's own CONTRIBUTING.md." >&2
+elif [ -n "$TITLE" ]; then
   if ! echo "$TITLE" | grep -qE "^(${PR_TYPES})\(([A-Z]{2,10}-[0-9]+|#[0-9]+)\)!?:"; then
     ERRORS="${ERRORS}PR title '$TITLE' doesn't match format: type(TICKET-ID): description\n"
     ERRORS="${ERRORS}Accepted types (from .claude/project-config.*.json → .pr.title_type_whitelist): ${PR_TYPES//|/, }\n"
