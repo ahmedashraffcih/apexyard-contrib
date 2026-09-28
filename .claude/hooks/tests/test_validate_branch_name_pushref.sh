@@ -384,6 +384,28 @@ run_case "#1362: branch merely containing 'dependabot' still blocks" \
 run_case "#1362: renovate-bot/ lookalike still blocks" \
   "git push origin renovate-bot/bump-node" 2
 
+# Near-miss shapes. Each differs from an exempt prefix by one character or by
+# position, so each is the mistake a future edit to the anchor would make.
+run_case "#1362: dependabotx/ lookalike still blocks" \
+  "git push origin dependabotx/foo" 2
+
+run_case "#1362: renovate-fix (no slash) still blocks" \
+  "git push origin renovate-fix" 2
+
+run_case "#1362: dependabot as a mid-path segment still blocks" \
+  "git push origin feature/dependabot-x" 2
+
+run_case "#1362: capitalised Dependabot/ still blocks" \
+  "git push origin Dependabot/npm/x" 2
+
+# An empty first segment is not exempt. Git rejects a ref ending in "/", so the
+# practical risk is low, but the anchor should not accept a name no bot emits.
+run_case "#1362: bare dependabot/ is not exempt" \
+  "git push origin dependabot/" 2
+
+run_case "#1362: bare renovate/ is not exempt" \
+  "git push origin renovate/" 2
+
 # ---- Summary ------------------------------------------------------------
 
 echo ""

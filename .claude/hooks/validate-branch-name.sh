@@ -276,7 +276,15 @@ fi
 # the bot's to choose. Human branches are unaffected, and every other gate
 # (ticket-first, secrets, commit format, the merge gates) still applies to
 # whatever is pushed. The exemption is about the branch NAME only.
-if echo "$CURRENT_BRANCH" | grep -qE '^(dependabot|renovate)/'; then
+#
+# The trailing `[^/]` requires a non-empty first segment. A bare `dependabot/`
+# is not a ref git accepts, so exempting it would widen the surface for nothing.
+#
+# `.github/workflows/pr-title-check.yml` carries the same prefix list and the
+# same requirement. The two must stay in step (#1362): a prefix this hook
+# exempts but that check does not lets a bot PR pass the local push gate and
+# then fail CI on a title it was never going to carry.
+if echo "$CURRENT_BRANCH" | grep -qE '^(dependabot|renovate)/[^/]'; then
   exit 0
 fi
 
