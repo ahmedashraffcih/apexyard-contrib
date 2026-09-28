@@ -199,6 +199,23 @@ assert_write "python tarfile, kwarg var mode"    'python3 -c "import tarfile; ta
 assert_write "python os.open, nested arg"        'python3 -c "import os; os.open(str(path), os.O_WRONLY)"'
 assert_write "python os.open, join + O_CREAT"    'python3 -c "import os; os.open(os.path.join(d, \"f\"), os.O_CREAT)"'
 
+# A quoted argument beside a variable mode. The "no quote after the first
+# comma" form above cannot see these: the `encoding=` or the positional
+# `"utf-8"` supplies the quote, and `"utf-8"` is not a mode token either, so
+# both earlier clauses pass the call through. All four are writes on `dev`.
+assert_write "python open, var mode + encoding"  'python3 -c "open(path, mode, encoding=\"utf-8\")"'
+assert_write "python gzip, var mode + encoding"  'python3 -c "import gzip; gzip.open(path, mode, encoding=\"utf-8\")"'
+assert_write "python open, kwarg mode + newline" 'python3 -c "open(path, mode=mode, newline=\"\")"'
+assert_write "python codecs, var mode + charset" 'python3 -c "import codecs; codecs.open(path, mode, \"utf-8\")"'
+assert_write "python with-open var mode + enc"   'python3 -c "
+with open(path, mode, encoding=\"utf-8\") as f:
+    json.dump(d, f)
+"'
+
+# The read side of the same shape: a quoted `encoding=` with no mode argument
+# at all stays a read, which is the #1372 symptom this PR exists to remove.
+assert_read  "python open, encoding only"        'python3 -c "open(p, encoding=\"utf-8\").read()"'
+
 # shelve has its own mode alphabet: c creates, n creates new, w writes. Only r
 # is read-only, and none of the write letters is in the file-mode class.
 assert_write "python shelve.open c mode"         'python3 -c "import shelve; shelve.open(path, \"c\")"'

@@ -451,6 +451,24 @@ _BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*([:|][a-z0-9*]*)?\\\\?['\"]"
 # command that #1372 reports. os.open has its own flag clause below.
 _BDW_PY_VARMODE="(^|[^.])open\(.*,[^'\"]*\)|\b(io|tarfile|gzip|bz2|lzma|shelve)\.open\(.*,[^'\"]*\)"
 
+# The clause above asks whether a quote appears anywhere after the first comma,
+# so any quoted argument hides a variable mode sitting next to it:
+# `open(p, mode, encoding='utf-8')` and `codecs.open(p, mode, 'utf-8')` are
+# writes, but the `'utf-8'` makes them read as reads. This clause looks at the
+# argument itself instead of at the rest of the call.
+#
+# It matches a second positional argument that is a bare name — optionally
+# dotted, optionally called — followed by a `,` or a `)`, whatever comes after
+# it; and separately a `mode=` whose value starts with a letter or underscore
+# rather than a quote. The first argument is `[^,()]` or one nested `(...)`
+# group, so `open(os.path.join(d,'f'), m)` still matches while the leading
+# `open(` is not confused by a comma inside that first argument.
+#
+# `os.open` is excluded from the positional half for the same reason as above.
+# A literal `os.open(p, flags, mode=perm)` can still reach the `mode=` half and
+# read as a write; that direction is safe, and the form is rare.
+_BDW_PY_VARMODE2="((^|[^.A-Za-z0-9_])|\b(io|tarfile|gzip|bz2|lzma|codecs)\.)open\(([^,()]|\([^()]*\))*,[[:space:]]*[A-Za-z_][A-Za-z0-9_.]*(\([^()]*\))?[[:space:]]*[,)]|\bopen\(.*\bmode[[:space:]]*=[[:space:]]*[A-Za-z_]"
+
 # `os.open()` takes integer flags, not a mode string. These are its write
 # flags. `.*` for the same nested-call reason as above.
 _BDW_PY_OSOPEN="\bos\.open\(.*O_(WRONLY|RDWR|CREAT|APPEND|TRUNC)"
@@ -464,7 +482,7 @@ _BDW_PY_SHELVE="\bshelve\.open\(.*\\\\?['\"][cnw]"
 # files. `dev` caught the tarfile form only because every `.tar` path contains
 # the letter `a`; it never caught the zipfile form at all. Matching the
 # extraction call itself is what the shell-side `tar -x` matcher already does.
-_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_OSOPEN}|${_BDW_PY_SHELVE}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
+_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_VARMODE2}|${_BDW_PY_OSOPEN}|${_BDW_PY_SHELVE}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
 
 # 9. Embedded Python (-c) with write keywords. Extended in #153 to include
 #    pathlib touch, shutil copy*/move, os.rename.
