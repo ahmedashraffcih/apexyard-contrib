@@ -434,18 +434,37 @@ _bdw_match_wget_output() {
 # read, because the leading `[wax+]` still has to match.
 _BDW_PY_MODE="\\\\?['\"][rbtU]*[wax+][rwxabt+U]*([:|][a-z0-9*]*)?\\\\?['\"]"
 
-# A second argument that is a bare identifier — no quotes, no `=` — is a mode
-# held in a variable. It could be any mode, so it counts as a write.
-_BDW_PY_VARMODE="\bopen\([^,)]*,[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[,)]"
+# A call whose arguments after the first comma contain NO quote at all has no
+# literal mode to read, so the mode is unknown and the call counts as a write.
+# That covers a mode in a variable, in a keyword, or behind an attribute or a
+# method call — `open(p, m)`, `open(p, mode=m)`, `open(p, self.mode)`,
+# `open(p, mode.lower())`. A call with a quoted argument is left to the mode
+# clause above, so `open(p, encoding='utf-8')` stays a read.
+#
+# `.*` rather than `[^,)]*` for the first argument: the latter cannot cross a
+# nested `)`, so `open(str(path), mode)` and `open(os.path.join(d,'f'), m)`
+# escaped it. Both are ordinary shapes, and both were caught on `dev` only by
+# the letter `a` in `path` or `args`. That accident is not coverage.
+# `os.open` is deliberately excluded here — its flags are integers and never
+# quoted, so this clause would match every call including a read-only
+# `os.open(p, os.O_RDONLY)`. That is the same false positive on a read-only
+# command that #1372 reports. os.open has its own flag clause below.
+_BDW_PY_VARMODE="(^|[^.])open\(.*,[^'\"]*\)|\b(io|tarfile|gzip|bz2|lzma|shelve)\.open\(.*,[^'\"]*\)"
 
-# `os.open()` takes integer flags, not a mode string. These are its write flags.
-_BDW_PY_OSOPEN="\bos\.open\([^)]*O_(WRONLY|RDWR|CREAT|APPEND|TRUNC)"
+# `os.open()` takes integer flags, not a mode string. These are its write
+# flags. `.*` for the same nested-call reason as above.
+_BDW_PY_OSOPEN="\bos\.open\(.*O_(WRONLY|RDWR|CREAT|APPEND|TRUNC)"
+
+# `shelve.open()` has its own mode alphabet: 'c' creates if absent, 'n' always
+# creates new, 'w' opens for writing. Only 'r' is read-only, and none of the
+# write letters appear in the file-mode class above.
+_BDW_PY_SHELVE="\bshelve\.open\(.*\\\\?['\"][cnw]"
 
 # `.extractall(` covers tarfile and zipfile extraction, both of which write
 # files. `dev` caught the tarfile form only because every `.tar` path contains
 # the letter `a`; it never caught the zipfile form at all. Matching the
 # extraction call itself is what the shell-side `tar -x` matcher already does.
-_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_OSOPEN}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
+_BDW_PYTHON_WRITE_RE="\.write_text\b|\.write\b|\bopen\(.*,.*${_BDW_PY_MODE}|\.open\(.*${_BDW_PY_MODE}|${_BDW_PY_VARMODE}|${_BDW_PY_OSOPEN}|${_BDW_PY_SHELVE}|\bopen\(\*|\.touch\(|\.extractall\(|\bshutil\.(copy|copyfile|copy2|copytree|move)\b|\bos\.rename\b"
 
 # 9. Embedded Python (-c) with write keywords. Extended in #153 to include
 #    pathlib touch, shutil copy*/move, os.rename.

@@ -184,6 +184,27 @@ assert_write "python open star-args"          'python3 -c "open(*args)"'
 
 # Archive extraction writes files. `dev` caught the tarfile form only because
 # every ".tar" path contains an `a`, and never caught the zipfile form at all.
+# A mode that is not a quoted literal cannot be read, so the call counts as a
+# write. These shapes were all caught on `dev` only by the letter `a` in an
+# identifier like `path` or `args` — rename the variable and that accident
+# disappears, which is why each is pinned here rather than left to the earlier
+# plain-identifier form.
+assert_write "python open, kwarg variable mode"  'python3 -c "open(path, mode=mode)"'
+assert_write "python open, attribute mode"       'python3 -c "open(path, self.mode)"'
+assert_write "python open, argparse attr mode"   'python3 -c "open(path, args.mode)"'
+assert_write "python open, method-call mode"     'python3 -c "open(p, mode.lower())"'
+assert_write "python open, nested arg + var"     'python3 -c "open(str(path), mode)"'
+assert_write "python open, join + var mode"      'python3 -c "open(os.path.join(d, \"f\"), m)"'
+assert_write "python tarfile, kwarg var mode"    'python3 -c "import tarfile; tarfile.open(path, mode=m)"'
+assert_write "python os.open, nested arg"        'python3 -c "import os; os.open(str(path), os.O_WRONLY)"'
+assert_write "python os.open, join + O_CREAT"    'python3 -c "import os; os.open(os.path.join(d, \"f\"), os.O_CREAT)"'
+
+# shelve has its own mode alphabet: c creates, n creates new, w writes. Only r
+# is read-only, and none of the write letters is in the file-mode class.
+assert_write "python shelve.open c mode"         'python3 -c "import shelve; shelve.open(path, \"c\")"'
+assert_write "python shelve.open n mode"         'python3 -c "import shelve; shelve.open(path, \"n\")"'
+assert_read  "python shelve.open r mode"         'python3 -c "import shelve; shelve.open(path, \"r\")"'
+
 assert_write "python tarfile extractall"      'python3 -c "import tarfile; tarfile.open(\"b.tar\").extractall(\".\")"'
 assert_write "python zipfile extractall"      'python3 -c "import zipfile; zipfile.ZipFile(\"b.zip\").extractall(\".\")"'
 
