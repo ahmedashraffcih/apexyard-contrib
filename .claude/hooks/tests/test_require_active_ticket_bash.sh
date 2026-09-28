@@ -806,6 +806,69 @@ sb=$(make_sandbox)
 in=$(jq -nc --arg c "cat < src/app.ts" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#886 sanity: plain '<' read is not gated" 0 "" "$in" "$sb"
 
+# --- #1414: `>&word`, grouped/long sed -i, and sed `w` -----------------
+#
+# Each write below exited 0 with no ticket on dev at 5be9ecb, and wrote
+# the file. The fix must block each one without a ticket and allow it
+# with one. The fd copy and the sed reads must stay ungated.
+
+for c in "echo x >&src/app.ts" "echo x >& src/app.ts" \
+         "sed -n 'w src/app.ts' in.txt" "sed 's/a/b/w src/app.ts' in.txt" \
+         "sed -n 'p;w src/app.ts' in.txt" "sed -Ei 's/a/b/' src/app.ts" \
+         "sed --in-place 's/a/b/' src/app.ts"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+
+  sb=$(make_sandbox)
+  cat > "$sb/.claude/session/current-ticket" <<EOF
+repo=me2resh/apexyard
+number=1414
+title=detector misses test
+EOF
+  run_case "#1414 allowed WITH ticket: $c" 0 "" "$in" "$sb"
+done
+
+for c in "echo x >&2" "sed -n '/warning/p' src/app.ts" "sed 's/w/x/' src/app.ts" \
+         'out=$(npm test 2>&1)' 'bash -c "npm test 2>&1"' \
+         "find . -name '*.md' -exec sed -n 1p {} + -print"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sanity: read stays ungated: $c" 0 "" "$in" "$sb"
+done
+
+# A sed -i edit whose file operand is not extracted must still block when
+# the same command names an exempt sed `w` file. Each of these edits
+# src/app.ts. The first three blocked before #1414, and a first draft of
+# the fix let them pass.
+for c in 'sed -i "s/foo/bar/w /dev/stdout" src/app.ts' \
+         "sed -i 's/a/b/;w /tmp/x' src/app.ts" \
+         'sed -n "w /tmp/x" in.txt && sed -i "s/a/b/" src/app.ts' \
+         'sed --in-place "s/a/b/w /dev/stderr" src/app.ts'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sed -i beside an exempt w file blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+done
+
+# The same holds for other families with no extractable target. Each of
+# these blocks on dev, and a round-2 draft let them pass.
+for c in "awk -i inplace 1 src/app.ts; sed -n 'w /tmp/x' in.txt" \
+         "python3 -c \"open('src/app.ts','w').write('x')\"; sed -n 'w /tmp/x' in.txt" \
+         "tar -xf a.tar; sed -n 'w /tmp/x' in.txt" \
+         "go run ./gen && sed -n 's/x/y/w /dev/stdout' out.txt"; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 w decoy beside an unextracted write blocked w/o ticket: $c" 2 "BLOCKED" "$in" "$sb"
+done
+
+# rm alone is exempt, and a `w` to /tmp beside it stays exempt. An escaped
+# quote after an fd copy stays a read.
+for c in "rm -f old.ts; sed -n 'w /tmp/x' in.txt" 'bash -c "sh -c \"make 2>&1\""'; do
+  sb=$(make_sandbox)
+  in=$(jq -nc --arg c "$c" '{tool_name:"Bash", tool_input:{command:$c}}')
+  run_case "#1414 sanity: stays ungated: $c" 0 "" "$in" "$sb"
+done
+
 # --- #886/#926 round 4: ZERO whitespace between operator and target -----
 #
 # Hakim's fourth adversarial re-hunt: the mandatory `[[:space:]]+` after
@@ -972,6 +1035,68 @@ rm -rf "$home_sim"
 sb=$(make_sandbox_no_pathresolve)
 in=$(jq -nc --arg c "echo x > src/app.ts" '{tool_name:"Bash", tool_input:{command:$c}}')
 run_case "#1089 fail-closed: in-repo write still BLOCKED when lib missing" 2 "BLOCKED" "$in" "$sb"
+
+# --- #1396: honor the active ticket for an unextractable Bash target ---
+#
+# active_ticket_marker_for_path used to return an empty marker as soon as
+# the target path could not be resolved (`[ -n "$resolved" ] || return 0`),
+# BEFORE it ever looked at current-ticket. The gate then blocked the write
+# even though a ticket was active. The fix: skip only the per-worktree and
+# per-project tiers when the target is unknown (there is no project to
+# resolve), and still check the ops-level current-ticket fallback.
+
+# 79. python3 -c with a COMPUTED path (no literal string) → unextractable
+#     target, but a current-ticket marker IS active → allowed (#1396 repro).
+sb=$(make_sandbox)
+cat > "$sb/.claude/session/current-ticket" <<EOF
+repo=me2resh/apexyard
+number=1396
+title=test
+url=https://example.com
+EOF
+in=$(jq -nc --arg c 'python3 -c "import pathlib; p = compute_path(); pathlib.Path(p).write_text(x)"' \
+  '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "#1396 unextractable target honors active ticket" 0 "" "$in" "$sb"
+
+# 80. Same command, NO ticket at all → still BLOCKED (the fix must not
+#     turn into a blanket exemption for unextractable targets).
+sb=$(make_sandbox)
+in=$(jq -nc --arg c 'python3 -c "import pathlib; p = compute_path(); pathlib.Path(p).write_text(x)"' \
+  '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "#1396 unextractable target still blocked w/o any ticket" 2 "BLOCKED" "$in" "$sb"
+
+# 81. Same command, a per-project marker exists for a DIFFERENT project but
+#     no current-ticket fallback → still BLOCKED (the per-project/per-
+#     worktree tiers are correctly skipped for an unknown target — they
+#     require a resolved project, which an unextractable target never has —
+#     and skipping them must not accidentally fall back to granting one of
+#     their markers).
+sb=$(make_sandbox)
+mkdir -p "$sb/.claude/session/tickets"
+cat > "$sb/.claude/session/tickets/myproj" <<EOF
+repo=me2resh/apexyard
+number=513
+title=unrelated project ticket
+EOF
+in=$(jq -nc --arg c 'python3 -c "import pathlib; p = compute_path(); pathlib.Path(p).write_text(x)"' \
+  '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "#1396 unextractable target ignores an unrelated per-project marker" 2 "BLOCKED" "$in" "$sb"
+
+# 82. The #1396 issue's own reported repro: an in-place `sed -i` edit on a
+#     path held in a shell variable, not the python3 shape cases 79-81 use.
+#     bash_extract_write_targets does not extract a sed -i target at all, so
+#     this is the same unextractable-target class — a current-ticket marker
+#     IS active → allowed.
+sb=$(make_sandbox)
+cat > "$sb/.claude/session/current-ticket" <<EOF
+repo=me2resh/apexyard
+number=1396
+title=test
+url=https://example.com
+EOF
+in=$(jq -nc --arg c 'sed -i "s/x/y/" "$VAR"' \
+  '{tool_name:"Bash", tool_input:{command:$c}}')
+run_case "#1396 reported repro: sed -i on a variable path honors active ticket" 0 "" "$in" "$sb"
 
 # --- Summary -----------------------------------------------------------
 

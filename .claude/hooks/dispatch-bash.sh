@@ -18,7 +18,30 @@ fi
 # Merge-shape detection for wrapped commands (AgDR-0162, me2resh/apexyard#1338).
 # Prefix case arms still handle the one-line forms. is_merge_command scans the
 # full payload command, so `bash -c` around tracker_pr_merge still routes.
-if [ -f "$HOOK_DIR/_lib-extract-pr.sh" ]; then
+#
+# Check [ -r ], not [ -f ] (A1, me2resh/apexyard#1403 review): under
+# `set -e`, sourcing a file that EXISTS but is unreadable makes the `.`
+# builtin fail, and the whole dispatcher then exits with that failure's
+# code (1) before any merge gate has run. Claude Code only blocks a tool
+# call on exit 2, so an unreadable library used to let every Bash command
+# through unblocked, not just merges — a silent fail-open, not a fail-closed
+# exit 1 as the exit code alone might suggest.
+#
+# A file that is MISSING entirely is a tolerated partial-install case:
+# is_merge_command stays undefined, and the fail-closed check further down
+# this script still runs the merge gates on any merge-shaped command. A file
+# that EXISTS and cannot be READ is a different, more suspicious case — a
+# broken permission or a tampered file, not a partial install — so it gets
+# an explicit block instead of silently falling through to that same path.
+if [ -e "$HOOK_DIR/_lib-extract-pr.sh" ] && [ ! -r "$HOOK_DIR/_lib-extract-pr.sh" ]; then
+  echo "BLOCKED: dispatcher found _lib-extract-pr.sh but cannot read it." >&2
+  echo "Unreadable: $HOOK_DIR/_lib-extract-pr.sh" >&2
+  echo "A dispatcher that cannot load its own merge-shape parser fails" >&2
+  echo "closed instead of silently skipping the check. Restore read" >&2
+  echo "permissions on the file and retry." >&2
+  exit 2
+fi
+if [ -r "$HOOK_DIR/_lib-extract-pr.sh" ]; then
   # shellcheck source=/dev/null
   . "$HOOK_DIR/_lib-extract-pr.sh"
 fi
@@ -44,6 +67,29 @@ run_hook() {
   fi
   if [ "$rc" -ne 0 ]; then
     printf 'WARN: %s exited %s; continuing with remaining gates.\n' "$script" "$rc" >&2
+  fi
+}
+
+# run_merge_gate_hook: the four MERGE-GATE hooks fail CLOSED, not open, on
+# any exit other than 0 or 2 (me2resh/apexyard#1403, AgDR-0169).
+#
+# run_hook above WARNS and continues past a non-2 non-zero exit, which is
+# right for an advisory check but wrong for a gate whose only job is to
+# decide whether a merge may proceed. A merge gate that cannot run its own
+# check (a missing sourced library under POSIX mode, for one) still exits
+# non-zero, just not 2 — and a normal Claude Code session never sets
+# POSIXLY_CORRECT, but other harnesses and CI shells may. `run_hook` would
+# log that as a WARN and let the merge through unreviewed. This wrapper
+# treats it as a BLOCKED instead.
+run_merge_gate_hook() {
+  local script="$1" rc=0
+  if "$HOOK_DIR/$script" <<<"$INPUT"; then :; else rc=$?; fi
+  if [ "$rc" -eq 2 ]; then
+    exit 2
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf 'BLOCKED: %s exited %s instead of a normal PASS. A merge gate that cannot run its own check fails closed, not open.\n' "$script" "$rc" >&2
+    exit 2
   fi
 }
 
@@ -122,10 +168,10 @@ run_merge_gates() {
     return 0
   fi
   _merge_gates_ran=1
-  run_hook block-unreviewed-merge.sh
-  run_hook require-design-review-for-ui.sh
-  run_hook block-merge-on-red-ci.sh
-  run_hook require-architecture-review.sh
+  run_merge_gate_hook block-unreviewed-merge.sh
+  run_merge_gate_hook require-design-review-for-ui.sh
+  run_merge_gate_hook block-merge-on-red-ci.sh
+  run_merge_gate_hook require-architecture-review.sh
 }
 
 case "$COMMAND" in
