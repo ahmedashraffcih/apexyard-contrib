@@ -103,30 +103,46 @@ STUB
   chmod +x "$sb/.bin/gh"
 }
 
-# Run a hook with a tool_input command and return its stderr + rc.
+# Run a hook with a tool_input command. Both results come back through globals
+# rather than stdout: `got=$(run_hook ...)` would run the function in a
+# subshell, so an exit code assigned inside it never reaches the caller — the
+# assertions would then compare against an empty string and pass whatever the
+# hook returned.
+#
+# The exit code matters here because these are trust-chain gates. A regression
+# that prints the right diagnostic and then exits 0 is the fail-open direction,
+# and a stderr-only assertion cannot see it.
+RC_LAST=""
+OUT_LAST=""
 run_hook() {
   local sb="$1" hook="$2" cmd="$3"
   local input
   input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
-  ( cd "$sb" && PATH="$sb/.bin:$PATH" bash ".claude/hooks/$hook" <<<"$input" 2>&1 >/dev/null )
+  OUT_LAST=$( cd "$sb" && PATH="$sb/.bin:$PATH" bash ".claude/hooks/$hook" <<<"$input" 2>&1 >/dev/null )
+  RC_LAST=$?
 }
 
+# assert_case <label> <stderr> <has|lacks> <expected-exit-code>
 assert_case() {
-  local label="$1" got="$2" mode="$3"   # mode: has | lacks
+  local label="$1" got="$2" mode="$3" want_rc="$4" rc="$RC_LAST"
   if [ "$mode" = "has" ]; then
-    if echo "$got" | grep -q "Tracker CLI said:" && echo "$got" | grep -qF "$CLI_ERROR"; then
-      echo "PASS [$label]"; PASS=$((PASS+1)); return
+    if ! { echo "$got" | grep -q "Tracker CLI said:" && echo "$got" | grep -qF "$CLI_ERROR"; }; then
+      echo "FAIL [$label]: expected the CLI error to be quoted" >&2
+      echo "    stderr: ${got:0:400}" >&2
+      FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "; return
     fi
-    echo "FAIL [$label]: expected the CLI error to be quoted" >&2
-    echo "    stderr: ${got:0:400}" >&2
   else
-    if ! echo "$got" | grep -q "Tracker CLI said:"; then
-      echo "PASS [$label]"; PASS=$((PASS+1)); return
+    if echo "$got" | grep -q "Tracker CLI said:"; then
+      echo "FAIL [$label]: expected silence, but the CLI error was quoted" >&2
+      echo "    stderr: ${got:0:400}" >&2
+      FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "; return
     fi
-    echo "FAIL [$label]: expected silence, but the CLI error was quoted" >&2
-    echo "    stderr: ${got:0:400}" >&2
   fi
-  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "
+  if [ -n "$want_rc" ] && [ "$rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want exit $want_rc, got $rc" >&2
+    FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}${label} "; return
+  fi
+  echo "PASS [$label]"; PASS=$((PASS+1))
 }
 
 BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |'
@@ -137,9 +153,10 @@ BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |'
 sb=$(make_sandbox "validate-pr-create.sh")
 install_failing_gh "$sb"
 printf '%s' "$BODY" > "$sb/body.md"
-got=$(run_hook "$sb" "validate-pr-create.sh" \
-  "gh pr create --title \"fix(#4242): diag\" --body-file $sb/body.md --head fix/#1336-diag-test")
-assert_case "pr-create: block path quotes the CLI error" "$got" has
+run_hook "$sb" "validate-pr-create.sh" \
+  "gh pr create --title \"fix(#4242): diag\" --body-file $sb/body.md --head fix/#1336-diag-test"
+got="$OUT_LAST"
+assert_case "pr-create: block path quotes the CLI error" "$got" has 2
 rm -rf "$sb"
 
 # Origin fails, upstream succeeds → the ordinary #207 path. Must stay silent:
@@ -147,29 +164,32 @@ rm -rf "$sb"
 sb=$(make_sandbox "validate-pr-create.sh")
 install_failing_gh "$sb" "me2resh/apexyard"
 printf '%s' "$BODY" > "$sb/body.md"
-got=$(run_hook "$sb" "validate-pr-create.sh" \
-  "gh pr create --title \"fix(#150): upstream only\" --body-file $sb/body.md --head fix/#1336-diag-test")
-assert_case "pr-create: successful upstream fallback stays silent" "$got" lacks
+run_hook "$sb" "validate-pr-create.sh" \
+  "gh pr create --title \"fix(#150): upstream only\" --body-file $sb/body.md --head fix/#1336-diag-test"
+got="$OUT_LAST"
+assert_case "pr-create: successful upstream fallback stays silent" "$got" lacks 0
 rm -rf "$sb"
 
 # ---- verify-commit-refs.sh ----------------------------------------------
 
 sb=$(make_sandbox "verify-commit-refs.sh")
 install_failing_gh "$sb"
-got=$(run_hook "$sb" "verify-commit-refs.sh" \
+run_hook "$sb" "verify-commit-refs.sh" \
   'git commit -m "fix: thing
 
-Closes #4242"')
-assert_case "commit-refs: block path quotes the CLI error" "$got" has
+Closes #4242"'
+got="$OUT_LAST"
+assert_case "commit-refs: block path quotes the CLI error" "$got" has 2
 rm -rf "$sb"
 
 sb=$(make_sandbox "verify-commit-refs.sh")
 install_failing_gh "$sb" "me2resh/apexyard"
-got=$(run_hook "$sb" "verify-commit-refs.sh" \
+run_hook "$sb" "verify-commit-refs.sh" \
   'git commit -m "fix: thing
 
-Closes #150"')
-assert_case "commit-refs: successful upstream fallback stays silent" "$got" lacks
+Closes #150"'
+got="$OUT_LAST"
+assert_case "commit-refs: successful upstream fallback stays silent" "$got" lacks 0
 rm -rf "$sb"
 
 # Multi-ref regression: this hook loops over every ref in the message, sharing
@@ -180,12 +200,13 @@ rm -rf "$sb"
 # ends up printing nothing at all for the ref that blocks.
 sb=$(make_sandbox "verify-commit-refs.sh")
 install_failing_gh "$sb" "me2resh/apexyard" "999"
-got=$(run_hook "$sb" "verify-commit-refs.sh" \
+run_hook "$sb" "verify-commit-refs.sh" \
   'git commit -m "fix: thing
 
 Closes #100
-Refs #999"')
-assert_case "commit-refs: failing ref keeps its error when a later ref resolves" "$got" has
+Refs #999"'
+got="$OUT_LAST"
+assert_case "commit-refs: failing ref keeps its error when a later ref resolves" "$got" has 2
 rm -rf "$sb"
 
 # ---- require-migration-ticket.sh ----------------------------------------
@@ -201,14 +222,17 @@ printf 'repo=fork-org/apexyard\nnumber=4242\ntitle=t\nurl=u\n' > "$sb/.claude/se
 # so the target must be absolute for `db/migrate/*.rb` to match.
 mig_input=$(jq -nc --arg p "$sb/db/migrate/20260101_add_column.rb" '{tool_name:"Edit",tool_input:{file_path:$p}}')
 got=$( cd "$sb" && PATH="$sb/.bin:$PATH" bash .claude/hooks/require-migration-ticket.sh <<<"$mig_input" 2>&1 >/dev/null )
-# Only assert when the gate actually reached its tracker lookup; an earlier
-# guard (no migration path matched) is a different branch and not this test's
-# subject.
-if echo "$got" | grep -q "BLOCKED: Could not fetch"; then
-  assert_case "migration gate: fail-closed block quotes the CLI error" "$got" has
+RC_LAST=$?
+# The gate MUST reach its tracker lookup for this case to mean anything. An
+# earlier exit is not a reason to skip: exiting before the lookup on a
+# migration path is the fail-open direction, and a silent SKIP would hide
+# exactly that regression while the suite still passed.
+if ! echo "$got" | grep -q "BLOCKED: Could not fetch"; then
+  echo "FAIL [migration gate]: hook exited before the tracker lookup (exit $RC_LAST)" >&2
+  echo "    stderr: ${got:0:300}" >&2
+  FAIL=$((FAIL+1)); FAILED_CASES="${FAILED_CASES}migration-gate-reached-lookup "
 else
-  echo "SKIP [migration gate]: hook exited before the tracker lookup"
-  echo "    stderr: ${got:0:300}"
+  assert_case "migration gate: fail-closed block quotes the CLI error" "$got" has 2
 fi
 rm -rf "$sb"
 

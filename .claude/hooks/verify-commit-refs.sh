@@ -420,11 +420,16 @@ SHAPE_ONLY=""
 # successful one that writes nothing — would otherwise wipe the error belonging
 # to the ref that actually went missing. Copy the text out at the moment a ref
 # fails, and report that.
-TRACKER_ERR=$(mktemp)
-# If mktemp failed, redirect to /dev/null rather than to an empty path, which
-# bash reports as an ambiguous redirect on every lookup.
-[ -n "$TRACKER_ERR" ] || TRACKER_ERR=/dev/null
-trap 'rm -f "$TRACKER_ERR"' EXIT
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on every lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
 TRACKER_ERR_TEXT=""
 
 for REF in $REFS; do

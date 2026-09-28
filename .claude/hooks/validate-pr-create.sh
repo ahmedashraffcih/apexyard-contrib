@@ -405,11 +405,16 @@ if [ -n "$TICKET_REF" ]; then
     # lookup — the quieter of the two options, and the one the two-step lookup
     # (#207) needs: an ordinary fork-then-upstream miss resolves successfully
     # and never reaches a branch that reads the file.
-    TRACKER_ERR=$(mktemp)
-    # If mktemp failed, redirect to /dev/null rather than to an empty path,
-    # which bash reports as an ambiguous redirect on every lookup.
-    [ -n "$TRACKER_ERR" ] || TRACKER_ERR=/dev/null
-    trap 'rm -f "$TRACKER_ERR"' EXIT
+    # Redirect to /dev/null when mktemp fails, rather than to an empty path,
+    # which bash reports as an ambiguous redirect on every lookup. The trap is
+    # set ONLY when mktemp succeeded: an unconditional trap would run
+    # `rm -f /dev/null`, which under root removes the device node and turns
+    # every later redirect to /dev/null on that host into a regular file.
+    if TRACKER_ERR=$(mktemp); then
+      trap 'rm -f "$TRACKER_ERR"' EXIT
+    else
+      TRACKER_ERR=/dev/null
+    fi
     # Dispatch via the tracker lib. For non-gh kinds the {owner_repo}
     # placeholder is supplied but the template may not reference it.
     ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TRACKER_REPO" 2>"$TRACKER_ERR")

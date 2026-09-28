@@ -573,11 +573,16 @@ fi
 # to the lookup that failed. The gh fallback branch captures the same way — it
 # reaches the identical block path, so discarding its stderr would leave
 # exactly the gap this fix closes.
-TRACKER_ERR=$(mktemp)
-# If mktemp failed, redirect to /dev/null rather than to an empty path, which
-# bash reports as an ambiguous redirect on the lookup.
-[ -n "$TRACKER_ERR" ] || TRACKER_ERR=/dev/null
-trap 'rm -f "$TRACKER_ERR"' EXIT
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on the lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
 
 if command -v tracker_view >/dev/null 2>&1; then
   ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TICKET_REPO" 2>"$TRACKER_ERR")
