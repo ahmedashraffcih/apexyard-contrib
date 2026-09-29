@@ -54,15 +54,65 @@
 
 INPUT=$(cat)
 
+# _require_lib <path>: source a REQUIRED library or fail closed.
+#
+# Without this guard, a missing/unreadable library leaves is_merge_command
+# (and the other functions the library defines) undefined. In default
+# (non-POSIX) bash, sourcing a missing file with a bare `.` returns 1 and
+# the script keeps running — the later `if ! is_merge_command "$COMMAND";
+# then exit 0; fi` check then calls an undefined function, bash reports
+# "command not found" (exit 127), the negated check reads that as "not a
+# merge command", and the hook exits 0. That exit is a clean, deliberate-
+# looking 0, not a crash, so the dispatcher's fail-closed wrapper
+# (AgDR-0169) cannot see it — this gate silently opens. See
+# me2resh/apexyard#1405 review finding H2 and AgDR-0169.
+#
+# Checking readability with `[ -r ]` BEFORE ever calling `.` also matters
+# under `bash --posix` / `POSIXLY_CORRECT=1`: a special builtin such as `.`
+# that fails to find its argument ends a non-interactive POSIX-mode shell
+# immediately, even inside an `if`/`||` guard around the `.` call itself —
+# verified empirically (see AgDR-0169). `[ -r ]` is an ordinary test
+# builtin, so it never triggers that behavior; this function never calls
+# `.` on a path it has not already confirmed is readable.
+_require_lib() {
+  local lib="$1"
+  if [ ! -r "$lib" ]; then
+    echo "BLOCKED: merge gate cannot load a required library." >&2
+    echo "Missing or unreadable: $lib" >&2
+    echo "A merge gate that cannot load its own logic fails closed" >&2
+    echo "instead of skipping the check. Restore the file and retry." >&2
+    exit 2
+  fi
+  # shellcheck disable=SC1090,SC1091
+  if ! . "$lib"; then
+    echo "BLOCKED: merge gate failed to load a required library." >&2
+    echo "Source failed: $lib" >&2
+    echo "A merge gate that cannot load its own logic fails closed" >&2
+    echo "instead of skipping the check. Fix the file and retry." >&2
+    exit 2
+  fi
+}
+
 # Shared merge-shape detector + PR-number parser (see _lib-extract-pr.sh).
 # Handles `gh pr merge <N>` and `gh api repos/<owner>/<repo>/pulls/<N>/merge`.
 # Sourced BEFORE the jq-based command parse below (moved up from its
 # original position after the parse) so is_merge_command is available as
 # the jq-independent fallback detector when the parse can't be trusted —
 # see #965.
-. "$(dirname "$0")/_lib-extract-pr.sh"
+_require_lib "$(dirname "$0")/_lib-extract-pr.sh"
 # Repo-qualified marker path helper (#485).
-. "$(dirname "$0")/_lib-review-markers.sh"
+_require_lib "$(dirname "$0")/_lib-review-markers.sh"
+# Behind-base detection independent of the forge's mergeStateStatus field
+# (me2resh/apexyard#1386 — see _lib-merge-behind.sh for why). Optional, not
+# a _require_lib dependency: this library only appends an advisory note to
+# a block path that already exits 2 for another reason (a missing or stale
+# Rex marker). Its absence removes that note, not the block itself, so a
+# missing/unreadable file here must not turn an otherwise-working gate into
+# a blanket block on every Bash command (AgDR-0169).
+if [ -r "$(dirname "$0")/_lib-merge-behind.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$(dirname "$0")/_lib-merge-behind.sh"
+fi
 # Leading cd-target recovery for shared merge-repo resolution (#687/#1151).
 # Optional only for standalone hook-test sandboxes that copy a minimal lib set.
 if [ -f "$(dirname "$0")/_lib-pr-repo.sh" ]; then
@@ -136,9 +186,23 @@ fi
 # filename (still "-ceo.approved"), the structured fields (sha=,
 # approved_by=user, skill_version=), or any gate logic — those are parsed
 # and compared exactly as before, regardless of this value. Default "CEO"
-# is a zero-behaviour-change no-op.
-# shellcheck source=/dev/null
-. "$(dirname "$0")/_lib-read-config.sh" 2>/dev/null || true
+# is a zero-behaviour-change no-op. This library is genuinely OPTIONAL
+# here — a missing file falls straight through to the "CEO" default two
+# lines down — so it stays a soft, non-blocking read, unlike _require_lib
+# above for the two hard-required libraries.
+#
+# The `[ -r ]` check runs BEFORE the `.` call, not after via `|| true`:
+# under `bash --posix` / POSIXLY_CORRECT=1, `. "$missing" 2>/dev/null ||
+# true` still ends the whole shell immediately on a missing file — a
+# special builtin's failure is fatal for a non-interactive POSIX-mode
+# shell even inside an `||` guard around the failing command itself
+# (verified empirically; see AgDR-0169 and me2resh/apexyard#1405 review).
+# Never calling `.` on a path that is not already known to be readable
+# avoids that fatal case entirely, in both default and POSIX-mode bash.
+if [ -r "$(dirname "$0")/_lib-read-config.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$(dirname "$0")/_lib-read-config.sh"
+fi
 if command -v config_get_or >/dev/null 2>&1; then
   APPROVER_TITLE=$(config_get_or '.review_markers.human_approver_title' 'CEO')
 else
@@ -249,6 +313,64 @@ MSG
   exit 2
 fi
 
+# Base branch name, resolved ONCE from the forge and reused by both the
+# carry-over checks below and print_behind_base_note — avoids three
+# separate `gh pr view ... baseRefName` calls for the same PR. Empty when
+# CMD_REPO is empty (an unscoped --repo, see the #887 note further down);
+# every caller of $BASE_REF_NAME already degrades correctly on empty (the
+# carry-over functions require it non-empty and return "unknown" without
+# it; print_behind_base_note already skips on empty CMD_REPO first).
+BASE_REF_NAME=""
+if [ -n "${CMD_REPO:-}" ]; then
+  BASE_REF_NAME=$(gh pr view "$PR_NUMBER" --repo "$CMD_REPO" --json baseRefName -q '.baseRefName' 2>/dev/null)
+fi
+
+# --- Optional behind-base note, shared by the two blocks below (#1386) ---
+# Advisory only — it adds NO new blocking condition. Both call sites already
+# block for another reason (a missing or stale Rex marker); this only
+# appends a likely contributing reason to that existing block.
+#
+# Reads "behind" from the compare API (is_pr_behind_base), not from
+# mergeStateStatus — GitHub only reports mergeStateStatus=BEHIND when the
+# base ruleset has strict_required_status_checks_policy=true, which #1386's
+# own issue body reports is OFF here. A PR that is genuinely behind an
+# unprotected base reports BLOCKED, CLEAN, or UNKNOWN instead, so reading
+# mergeStateStatus alone would miss it. See _lib-merge-behind.sh.
+#
+# The note addresses the human approver, not the agent reading this stderr:
+# updating a PR's branch pushes a merge commit to the PR's head branch, and
+# on a fork PR with maintainer edits that branch belongs to the contributor.
+# Only the user decides whether that push happens.
+print_behind_base_note() {
+  # Skip entirely when _lib-merge-behind.sh did not load (optional, see the
+  # [ -r ] guard above). is_pr_behind_base is then undefined, and calling
+  # an undefined function here would print noise to stderr for no gain —
+  # the note is advisory, so its absence is silent, not an error.
+  if ! command -v is_pr_behind_base >/dev/null 2>&1; then
+    return 0
+  fi
+  # Skip both lookups when the merge command names no repo. An empty
+  # --repo lets `gh` resolve the ambient repo from local git remotes
+  # instead (the #887 class) — the note could then describe a different
+  # repo's PR with the same number. Fail silent, not silently wrong.
+  if [ -z "${CMD_REPO:-}" ]; then
+    return 0
+  fi
+  local base behind
+  base="${BASE_REF_NAME:-}"
+  behind=$(is_pr_behind_base "$CMD_REPO" "$base" "$CURRENT_SHA")
+  if [ "$behind" = "true" ]; then
+    cat >&2 <<MSG3
+
+NOTE: PR #${PR_NUMBER} is also behind its base branch (${base:-its base}).
+Ask the ${APPROVER_TITLE} to update the branch or to approve that update.
+The update command is: gh pr update-branch ${PR_NUMBER} --repo ${CMD_REPO}
+Do not update it yourself. Then wait for green CI and re-run /code-review
+before /approve-merge.
+MSG3
+  fi
+}
+
 # --- Rex marker check ---
 if [ ! -f "$REX_APPROVAL" ]; then
   cat >&2 <<MSG
@@ -290,17 +412,49 @@ MSG
   if _NEAR_MISS_HINT=$(unqualified_marker_hint "$MARKER_HOME" "$PR_NUMBER" rex "$REX_APPROVAL" 2>/dev/null); then
     printf '%s\n' "$_NEAR_MISS_HINT" >&2
   fi
+  # This merge was already refused above (missing Rex marker); the note
+  # below only names a likely contributing reason. See print_behind_base_note.
+  print_behind_base_note
   exit 2
 fi
 
 REX_SHA=$(tr -d '[:space:]' < "$REX_APPROVAL")
-if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ]; then
+# --- Carry the Rex approval across a verified base-branch merge (#1437, #1456) ---
+# When HEAD moved because the PR was refreshed against its base — not
+# because new work landed — and that refresh is a conflict-free two-parent
+# merge of the Rex-approved commit, the marker's original SHA no longer
+# matches HEAD even though nothing Rex reviewed actually changed.
+# rex_approval_carries_over (_lib-merge-behind.sh) verifies this against the
+# FORGE, not local git state: parent[0] must equal REX_SHA per the forge
+# commit API, parent[1] must be an ancestor of the base branch's CURRENT tip
+# (resolved via the branches endpoint so a tag cannot shadow the name), and
+# a `git merge-tree --write-tree` of the two parents must reproduce the
+# forge-reported tree for HEAD — run in a fresh empty GIT_DIR that reads
+# objects only through alternates, so a local merge driver or grafts entry
+# cannot change the result. Fails closed on any uncertainty — an
+# unresolvable base tip, a missing object, a failed fetch, a non-merge
+# commit, an octopus merge, a second parent not on the base branch, or a
+# merge-tree mismatch all fall through to the ordinary stale-marker block
+# below. No agent writes a marker for this. The gate decides on its own,
+# from state a local file write cannot fabricate.
+_CARRY_OVER="false"
+if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ] \
+   && command -v rex_approval_carries_over >/dev/null 2>&1; then
+  _CARRY_OVER=$(rex_approval_carries_over "${CMD_REPO:-}" "$REX_SHA" "$CURRENT_SHA" "${BASE_REF_NAME:-}")
+fi
+if [ -n "$REX_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$REX_SHA" != "$CURRENT_SHA" ] \
+   && [ "$_CARRY_OVER" != "true" ]; then
   cat >&2 <<MSG
 BLOCKED: Code-reviewer approved commit ${REX_SHA:0:7} but HEAD is now ${CURRENT_SHA:0:7}.
 
 New commits were pushed after the Rex review. Re-invoke Rex on the latest
 HEAD before merging.
 MSG
+  # This merge was already refused above (stale Rex marker); the note
+  # below only names a likely contributing reason (#1386). A branch update
+  # would also explain the SHA mismatch itself — the PR moved after Rex's
+  # review, whether from a base-branch update or new commits.
+  print_behind_base_note
   exit 2
 fi
 
@@ -549,7 +703,22 @@ MSG
   exit 2
 fi
 
-if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ]; then
+# Same forge-verified carry-over applies to the CEO marker (#1437) — this is
+# a deliberate CEO decision, not an oversight: the marker and the merge are
+# one authorization moment (.claude/rules/pr-workflow.md), and that moment
+# is preserved, not re-litigated, when the ONLY thing that changed is a
+# mechanically-verified, conflict-free replay of the base branch the CEO
+# never reviewed content from. See AgDR-0178 "CEO marker carry-over is a
+# CEO decision" for the full reasoning. Re-checks the SAME condition
+# independently (never assumes the Rex-side check above already proved it)
+# — this comparison uses CEO_SHA, not REX_SHA, as parent[0].
+_CEO_CARRY_OVER="false"
+if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ] \
+   && command -v rex_approval_carries_over >/dev/null 2>&1; then
+  _CEO_CARRY_OVER=$(rex_approval_carries_over "${CMD_REPO:-}" "$CEO_SHA" "$CURRENT_SHA" "${BASE_REF_NAME:-}")
+fi
+if [ -n "$CEO_SHA" ] && [ -n "$CURRENT_SHA" ] && [ "$CEO_SHA" != "$CURRENT_SHA" ] \
+   && [ "$_CEO_CARRY_OVER" != "true" ]; then
   cat >&2 <<MSG
 BLOCKED: ${APPROVER_TITLE} approved commit ${CEO_SHA:0:7} but HEAD is now ${CURRENT_SHA:0:7}.
 

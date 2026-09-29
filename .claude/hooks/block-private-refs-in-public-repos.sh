@@ -1089,95 +1089,106 @@ fi
 #    _lib-multi-repo-trace.sh.
 # ---------------------------------------------------------------------------
 
-NAMES=""
-REPOS=""
-WORKSPACES=""
+# apexyard#1457 review round 2 (Hakim LOW-2) — indexed arrays, not
+# space-joined strings: NAMES_PUBLIC[i] / REPOS_PUBLIC[i] / WORKSPACES_PUBLIC[i]
+# pair with NAMES[i] / REPOS[i] / WORKSPACES[i] by POSITION, the same
+# per-entry pairing the staged and runtime hooks use. A membership-only
+# check (the pre-round-2 approach) could not tell two entries with the same
+# token apart; this can.
+NAMES=()
+NAMES_PUBLIC=()
+REPOS=()
+REPOS_PUBLIC=()
+WORKSPACES=()
+WORKSPACES_PUBLIC=()
 
-# awk parser: walk each `- name:` block and pull out `name`, every `repo`/
-# `repos[]` entry, and `workspace`. Strips surrounding quotes. Assumes
-# `- name:` is the first key in each project entry (same assumption as
-# /start-ticket).
-PARSED=$(awk '
-  function unquote(s) { gsub(/^["\x27]|["\x27]$/, "", s); return s }
-  /^[[:space:]]*- name:/ {
-    print "NAME=" unquote($3)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repo:/ {
-    print "REPO=" unquote($2)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*workspace:/ {
-    print "WORKSPACE=" unquote($2)
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repos:[[:space:]]*\[/ {
-    line = $0
-    sub(/^[^\[]*\[/, "", line); sub(/\].*$/, "", line)
-    n = split(line, parts, ",")
-    for (i = 1; i <= n; i++) {
-      item = parts[i]
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", item)
-      if (item != "") print "REPO=" unquote(item)
-    }
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*repos:[[:space:]]*(#.*)?$/ {
-    current_list = "repos"
-    next
-  }
-  /^[[:space:]]*[a-zA-Z_][a-zA-Z0-9_-]*:/ {
-    current_list = ""
-    next
-  }
-  /^[[:space:]]*-[[:space:]]+/ {
-    if (current_list == "repos") {
-      item = $0
-      sub(/^[[:space:]]*-[[:space:]]+/, "", item)
-      gsub(/[[:space:]]+$/, "", item)
-      print "REPO=" unquote(item)
-    }
-    next
-  }
-' "$REGISTRY")
+HOOK_DIR_FOR_PARSER=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -f "$HOOK_DIR_FOR_PARSER/_lib-registry-parser.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOOK_DIR_FOR_PARSER/_lib-registry-parser.sh"
+fi
 
+# apexyard#1457 review round 2 (Rex B1 / Hakim HIGH-2) — the registry
+# exists (checked earlier), so fail closed rather than silently scanning
+# nothing when the shared parser is missing or its parse fails.
+if ! declare -F registry_parse_entries >/dev/null 2>&1; then
+  echo "BLOCKED: shared registry parser (_lib-registry-parser.sh) is missing or failed to load. Cannot safely scan for a private portfolio reference." >&2
+  exit 2
+fi
+REGISTRY_PARSED=$(registry_parse_entries "$REGISTRY")
+REGISTRY_PARSE_RC=$?
+if [ "$REGISTRY_PARSE_RC" -ne 0 ]; then
+  echo "BLOCKED: registry parse failed (exit $REGISTRY_PARSE_RC) while scanning for a private portfolio reference." >&2
+  exit 2
+fi
+
+CURRENT_PUBLIC=0
 while IFS= read -r line; do
   case "$line" in
+    PUBLIC=*)
+      CURRENT_PUBLIC=${line#PUBLIC=}
+      ;;
     NAME=*)
       v=${line#NAME=}
-      [ -n "$v" ] && NAMES="$NAMES $v"
+      if [ -n "$v" ]; then
+        NAMES+=("$v")
+        NAMES_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
     REPO=*)
       v=${line#REPO=}
-      [ -n "$v" ] && REPOS="$REPOS $v"
+      if [ -n "$v" ]; then
+        REPOS+=("$v")
+        REPOS_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
     WORKSPACE=*)
       v=${line#WORKSPACE=}
-      [ -n "$v" ] && WORKSPACES="$WORKSPACES $v"
+      if [ -n "$v" ]; then
+        WORKSPACES+=("$v")
+        WORKSPACES_PUBLIC+=("$CURRENT_PUBLIC")
+      fi
       ;;
   esac
 done <<EOF
-$PARSED
+$REGISTRY_PARSED
 EOF
+
+# apexyard#1457 review round 3 (Hakim MEDIUM, elevated to blocking) — a
+# registry that plainly looks like it registers projects (a `projects:`
+# key AND at least one `name:` key) but produced zero tokens means the
+# parse missed a shape, not that nothing is registered. Fail closed.
+if [ "${#NAMES[@]}" -eq 0 ] && [ "${#REPOS[@]}" -eq 0 ] && [ "${#WORKSPACES[@]}" -eq 0 ]; then
+  if registry_has_project_shape "$REGISTRY"; then
+    echo "BLOCKED: registry parse produced no tokens despite a projects: key and a name: key being present in $REGISTRY. Cannot safely scan for a private portfolio reference." >&2
+    exit 2
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 # 8. Build the match list.
 #
-#   - `name` → whole-word match (grep -wE). Skip the target's own name, and
-#     skip names that collide with the target repo's own name, so mentioning
-#     "apexyard" in an apexyard upstream ticket is fine. Also skip the name
-#     whose `repo:` matches $TARGET_REPO (belt-and-braces).
+#   - `name` → whole-word match (grep -wE). Skip the target's own bare repo
+#     name, so mentioning "apexyard" in an apexyard upstream ticket is fine.
+#     ALSO exempt the target repo's OWNER login (me2resh/apexyard#1387), but
+#     narrowly: a registered project's `name` can coincidentally equal the
+#     owner of the public repo being written to (e.g. a private project
+#     literally named "me2resh"), and writing the repo out as
+#     "<owner>/<repo>", or plainly @-mentioning the owner in review prose,
+#     must not read as a leak of that unrelated project. The exemption
+#     covers ONLY those two forms — `@owner` and `owner/<repo-slug>`. A
+#     bare, standalone mention of the owner's name (no `@`, no `/`) still
+#     blocks, exactly like any other registered private project's name; the
+#     issue asked to keep the block in that case. See the owner-branch below
+#     for how the two safe forms are stripped before the bare-match check.
 #   - `repo` slug → exact match, with optional `#<N>` suffix.
 #   - `workspace` path → whole-word match.
 # ---------------------------------------------------------------------------
 
-# Derive the target's bare repo name for exemption (e.g. "apexyard" from
-# "me2resh/apexyard").
+# Derive the target's bare repo name and owner login for exemption (e.g.
+# "apexyard" and "me2resh" from "me2resh/apexyard").
 TARGET_NAME=$(echo "$TARGET_REPO" | awk -F/ '{print $NF}')
+TARGET_OWNER=$(echo "$TARGET_REPO" | awk -F/ '{print $1}')
 
 LEAKS=""
 
@@ -1193,18 +1204,71 @@ record_if_match() {
   fi
 }
 
-for n in $NAMES; do
-  # Exempt the target repo's own name.
+for name_idx in "${!NAMES[@]}"; do
+  n="${NAMES[$name_idx]}"
+  # apexyard#1455 — a registry entry marked `public: true` is not a leak.
+  # apexyard#1457 review round 2 (Hakim LOW-2) — paired by INDEX with the
+  # entry that produced $n, not by token-string membership.
+  [ "${NAMES_PUBLIC[$name_idx]}" = "1" ] && continue
+  # Exempt the target repo's own bare name entirely (pre-existing).
   if [ "$n" = "$TARGET_NAME" ]; then continue; fi
+
   # Whole-word, case-insensitive. Escape regex-special chars in $n.
   esc=$(printf '%s' "$n" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
+
+  if [ "$n" = "$TARGET_OWNER" ]; then
+    # me2resh/apexyard#1387 — narrow owner exemption. Strip only the two
+    # safe forms (`@owner`, `owner/<repo-slug>`) from a lower-cased copy of
+    # the haystack, then check whether the owner's name still appears as a
+    # bare, standalone word. If it does, this is not a safe mention and
+    # falls through to the ordinary block below, same as any other
+    # registered private project's name. Case-folded by hand (rather than
+    # `sed`'s GNU-only `I` suffix or ERE `\b`, both unsupported on BSD/macOS
+    # sed) so this stays portable across the hook's supported platforms.
+    #
+    # The two STRIP expressions use a wider boundary class
+    # (`[^A-Za-z0-9_-]`) than the final bare-mention check below. That
+    # class treats `-` as a word character, so it never strips PART of a
+    # hyphen-joined token — it only removes a clean `@owner` or
+    # `owner/<repo-slug>` occurrence. The slug half of the second strip
+    # excludes `.` from `[a-z0-9_-]+` (me2resh/apexyard#1400 security
+    # re-review, LOW 2): a GitHub repo slug segment can itself carry a
+    # dot, so stopping the slug capture at the first `.` means a second,
+    # glued mention right after a dot — `owner/repo.owner` — is never
+    # silently absorbed into the stripped slug. Worst case this narrows
+    # what the strip removes and a legitimate dotted slug ends up
+    # scrutinised again by the bare-mention check below; that fails in
+    # the hook's documented safe direction (more scanning, never less).
+    esc_lc=$(printf '%s' "$n" | tr '[:upper:]' '[:lower:]' | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
+    haystack_lc=$(printf '%s' "$HAYSTACK" | tr '[:upper:]' '[:lower:]')
+    stripped_lc=$(printf '%s' "$haystack_lc" | sed -E \
+      -e "s/@${esc_lc}([^A-Za-z0-9_-]|\$)/\\1/g" \
+      -e "s#(^|[^A-Za-z0-9_-])${esc_lc}/[a-z0-9_-]+#\\1#g")
+    # The bare-mention check uses a NARROWER boundary class than the strip
+    # expressions above: `[^A-Za-z0-9_]` treats `-` as a boundary, matching
+    # `grep -w`'s own notion of a word character (me2resh/apexyard#1400
+    # security re-review, LOW 1). Before this fix the wider `-`-as-word-char
+    # class let a hyphen-joined form such as `owner-tool` or `foo-owner`
+    # read as one token that never matched the bare-word pattern, so it
+    # passed the owner branch even though the generic per-name check two
+    # lines down (`grep -qiwE`, which already treats `-` as a boundary)
+    # would have blocked the exact same text for any OTHER registered name.
+    if ! printf '%s' "$stripped_lc" | grep -qE "(^|[^A-Za-z0-9_])${esc_lc}([^A-Za-z0-9_]|\$)"; then
+      continue
+    fi
+    # Falls through: a bare mention of the owner's name remains after
+    # stripping the safe forms, so it blocks like any other name below.
+  fi
+
   if echo "$HAYSTACK" | grep -qiwE "$esc"; then
     LEAKS="$LEAKS
   - project name: $n"
   fi
 done
 
-for rp in $REPOS; do
+for repo_idx in "${!REPOS[@]}"; do
+  rp="${REPOS[$repo_idx]}"
+  [ "${REPOS_PUBLIC[$repo_idx]}" = "1" ] && continue
   if [ "$rp" = "$TARGET_REPO" ]; then continue; fi
   esc=$(printf '%s' "$rp" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
   # Either bare slug (with word-ish boundary) or slug#<N>.
@@ -1214,7 +1278,9 @@ for rp in $REPOS; do
   fi
 done
 
-for ws in $WORKSPACES; do
+for ws_idx in "${!WORKSPACES[@]}"; do
+  ws="${WORKSPACES[$ws_idx]}"
+  [ "${WORKSPACES_PUBLIC[$ws_idx]}" = "1" ] && continue
   esc=$(printf '%s' "$ws" | sed -E 's/[][\\/.^$*+?(){}|]/\\&/g')
   # Workspace-path boundaries: path-chars `/` and `-` ARE allowed *after* the
   # match (e.g. `workspace/ws-marlow/app.ts` is a real reference — the

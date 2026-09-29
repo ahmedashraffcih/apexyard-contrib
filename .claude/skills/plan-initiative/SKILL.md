@@ -77,6 +77,11 @@ Both directories are created on first write if missing.
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 ### 1. Resolve the slug + check for an existing initiative doc
 
 Kebab-ify the argument (lowercase, hyphen-separated, alphanumeric only, max 60 chars). Confirm if the operator passed a non-kebab form.
@@ -148,6 +153,9 @@ Avoid output measures ("ship 10 features"). Prefer outcome measures
 ```
 
 **d) Scope**
+
+Use `AskUserQuestion` for the scope choice. Recommend the specific project when one is named.
+Otherwise recommend framework-wide scope. Use the prompt below only without the tool.
 
 ```
 Is this initiative scoped to:
@@ -265,7 +273,7 @@ if len(sorted_order) < len(milestones):
     # FAIL — print cycle, ask operator to resolve
 ```
 
-On cycle:
+On cycle, use `AskUserQuestion` for the three resolution types. Use the prompt below only without the tool:
 
 ```
 ⚠ Dependency cycle detected:
@@ -324,6 +332,30 @@ Append to the **Re-run history** table — one row per invocation:
 |------|-------|
 | YYYY-MM-DD | Initial creation — N milestones, scope=`{per-project / framework-wide}` |
 | YYYY-MM-DD | Added milestone "X"; filed M1, M2 as #123, #124 |
+
+### 6.5. Lint the rendered doc
+
+Run `lint.sh` against the file just written. The lint wraps the shared `_lib-mermaid-lint.sh` — it extracts the DAG's ` ```mermaid ` block and validates it via `mmdc` (mermaid-cli), so a broken block is caught at write time, not when a human opens the doc on GitHub. This block is a fresh process (per the per-block preamble rule above), so assign `output_path` explicitly to the same path resolved in step 2(d) / step 1 — do not reuse the variable name and leave it unset, or the lint call receives an empty path and exits 2:
+
+```bash
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-read-config.sh"
+source "$(git rev-parse --show-toplevel)/.claude/hooks/_lib-portfolio-paths.sh"
+projects_dir=$(portfolio_projects_dir)
+SKILL_DIR="$(git rev-parse --show-toplevel)/.claude/skills/plan-initiative"
+# Assign the literal path resolved in step 2(d) / step 1, for example:
+#   scope 1 (project-scoped): output_path="$projects_dir/<project_name>/initiatives/<slug>.md"
+#   scope 2 (framework-wide): output_path="$projects_dir/initiatives/<slug>.md"
+output_path="<path resolved in step 2(d) or step 1>"
+"$SKILL_DIR/lint.sh" "$output_path" || lint_rc=$?
+```
+
+Handle the exit code before reporting the doc as written:
+
+- **Exit 0** — clean. Report `Mermaid lint: clean` alongside the output path.
+- **Exit 1** — parse error. Print the lint output; fix the offending DAG block (a classDef or edge slipped past substitution) and re-lint, or ask the operator whether to proceed with `--skip-lint`. Never report success on an unfixed failure.
+- **Exit 2** — bad input to the lint call, most often `output_path` unset or pointing at a missing file. Fix the path assignment above and re-lint; never report the doc as written while this persists.
+- **Exit 3** — `mmdc` / Node unavailable. Print the warning `Mermaid not validated: mmdc not available.` and report `Mermaid not validated: mmdc not available` alongside the output path — do not claim the diagram is clean.
+- **`--skip-lint`** (operator-requested) — report `Mermaid lint skipped`.
 
 ### 7. Show the rendered doc + confirm
 
@@ -517,7 +549,7 @@ Append a row to the **Re-run history** table:
 ```
 ✓ /plan-initiative q3-auth-rewrite complete.
 
-Output: projects/<name>/initiatives/q3-auth-rewrite.md
+Output: projects/<name>/initiatives/q3-auth-rewrite.md (Mermaid lint: clean)
 Milestones: 5 total (3 just filed: #123, #124, #125 — 2 still unfiled in the doc)
 
 Next:
@@ -548,7 +580,7 @@ Next:
 - **Cross-initiative dependencies are out of scope for v1.** If Initiative A blocks Initiative B, capture that in prose in A's `## Anti-scope` or B's `## Goal` paragraph. v2 may add cross-initiative DAG semantics; v1 is one initiative at a time.
 - **Time/effort estimation is downstream.** The skill captures `confidence` in the operator's estimate, not the estimate itself. Estimation belongs in each milestone's filed Feature ticket via `/start-ticket` + the team's normal estimation flow.
 - **Resource allocation / role assignment is out of scope.** The framework's role-trigger machinery (per `.claude/rules/role-triggers.md`) handles who-picks-up-what once tickets are filed. `/plan-initiative` stops at the filing step.
-- **Mermaid renders, doesn't lint.** The skill outputs Mermaid `flowchart LR` blocks; doesn't run any Mermaid linter. If the operator wants to view the DAG outside GitHub's renderer, they pipe the block through `mmdc` themselves.
+- **Mermaid renders and lints.** The skill outputs Mermaid `flowchart LR` blocks and validates each one via step 6.5's `lint.sh` (the shared `_lib-mermaid-lint.sh`) before confirming the doc as written. Pass `--skip-lint` to bypass when `mmdc` is misbehaving.
 - **PDF export via `/pdf`.** The initiative doc is markdown; for stakeholder-share work, `/pdf projects/<name>/initiatives/<slug>.md` converts to PDF via the framework's standard converter dispatch.
 
 ## Related

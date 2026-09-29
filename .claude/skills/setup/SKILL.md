@@ -34,6 +34,11 @@ Re-running `/setup` on an already-configured fork shows the current config and a
 
 ## Process
 
+Use `AskUserQuestion` for every operator option menu in this skill. Follow `.claude/rules/reporting-style.md § Operator choices`.
+Preserve multiple selections where the menu permits them. Split menus with more than four options into sequential wizard questions.
+Keep single yes/no and ticket confirmation prompts as written.
+The prose menus below are fallbacks only when the harness lacks `AskUserQuestion`.
+
 > **Tip for the agent driving setup**: `docs/multi-project.md` is the canonical reference for portfolio modes, v1→v2 migration, custom-templates path-mirroring, the FAQ, and trade-offs. As of #372 it is **not** auto-imported into the session context (the 70k-char file was loading ~18k tokens into every session, even for adopters who never re-run setup). The steps below are self-contained for the mechanical setup. If a first-timer asks a question mid-setup that this SKILL doesn't answer directly, `Read docs/multi-project.md` on demand rather than guessing.
 
 ### Step −1: Pre-flight — refuse if `jq` is missing (REQUIRED)
@@ -77,7 +82,7 @@ See AgDR-0011 + me2resh/apexyard#150 for the design rationale.
 
 ### Step 0.5: Install the tracked git hooks (REQUIRED)
 
-`core.hooksPath` is a **per-clone** git config value — it lives in `.git/config`, never committed, so every fresh clone of the ops fork starts unset regardless of how many sibling clones already have it configured. Left unset, `.githooks/pre-push` (tracked, but inert without this) never runs on a terminal `git push` — only Claude-Code-driven pushes go through the equivalent `pre-push-gate.sh` PreToolUse hook. Run the installer once per fork, here, so a fresh `/setup` always leaves the clone protected on both paths:
+`core.hooksPath` is a **per-clone** git config value — it lives in `.git/config`, never committed, so every fresh clone of the ops fork starts unset regardless of how many sibling clones already have it configured. Left unset, `.githooks/pre-push` (tracked, but inert without this) never runs — not on a terminal `git push`, and not on a Claude Code-driven one either, since git invokes the same hook the same way regardless of which process ran the push. There is no equivalent Claude Code path anymore: `pre-push-gate.sh` only reminds a session to install this hook when a clone hasn't (#1366, AgDR-0173); it does not run this repo's configured `.pre_push.commands` itself. Run the installer once per fork, here, so a fresh `/setup` always leaves the clone actually protected:
 
 ```bash
 bash bin/install-git-hooks.sh
@@ -470,6 +475,10 @@ The "plugin-install commands printed" wording is accurate even after the empiric
 Pick the line that matches the actual outcome. Don't claim "enabled" if any of (b)–(d) failed.
 
 ### Step 2d: Harness selection (skippable)
+
+Use `AskUserQuestion` for harness selection. Recommend Claude Code first.
+Preserve multiple selections and split the six options across wizard questions.
+Use the numbered prompt below only when the harness lacks the tool.
 
 Background. As of 2026-07-09 the framework's mechanical gates (merge gate, ticket-first, secrets scanning, red-CI block) reach beyond Claude Code through thin per-harness adapters — see `docs/harnesses/README.md`, the single source of truth for the support matrix. This step surfaces that matrix at onboarding time so a non-Claude-Code adopter doesn't have to discover `docs/harnesses/` on their own. It is deliberately light: Claude Code adopters (the default) answer one question and move on.
 
