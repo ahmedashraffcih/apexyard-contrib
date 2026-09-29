@@ -24,6 +24,9 @@
 #     (meta / docs edits don't need a migration ticket even on paths
 #     that look migration-ish)
 #   - Any *.example file (migration templates in golden-paths/ etc.)
+#   - Alembic's env.py / script.py.mako under an alembic/ or migrations/
+#     directory — tooling the migration runs, not a revision script itself
+#     (me2resh/apexyard#1368)
 #
 # Path patterns are overridable per project via
 # `.claude/project-config.json`:
@@ -243,6 +246,19 @@ is_migration_path() {
     */src/migrations/*.ts|*/src/migrations/*.js) return 0 ;;
     # Alembic
     */alembic/versions/*.py) return 0 ;;
+    # Alembic tooling files are not migrations themselves (me2resh/apexyard#1368).
+    # env.py is the runtime config Alembic loads to run migrations.
+    # script.py.mako is the template new revisions are generated from.
+    # Neither is a revision script. The reported bug is only under a renamed
+    # `<root>/migrations/` script_location — a path segment literally named
+    # `migrations` reaches the generic `*/migrations/*` catch-all below. The
+    # default `alembic/` layout never reached that catch-all, so the
+    # `*/alembic/env.py|*/alembic/script.py.mako` arm changes no result on
+    # current defaults. It stays for defense: a future bare `alembic/` case
+    # would otherwise treat these two files as migrations. Both arms sit
+    # BEFORE the catch-all — `case` stops at the first matching arm.
+    */alembic/env.py|*/alembic/script.py.mako) return 1 ;;
+    */migrations/env.py|*/migrations/script.py.mako) return 1 ;;
     # Rails / ActiveRecord
     */db/migrate/*.rb) return 0 ;;
     # Generic — any file immediately under a `migrations/` directory, any extension
@@ -567,13 +583,30 @@ if [ "$TICKET_KIND" = "none" ]; then
   exit 0
 fi
 
+# Capture the tracker CLI's own stderr instead of discarding it, so the
+# fail-closed block below can name the real cause (#1336). This gate performs a
+# single lookup with no upstream fallback, so the captured text always belongs
+# to the lookup that failed. The gh fallback branch captures the same way — it
+# reaches the identical block path, so discarding its stderr would leave
+# exactly the gap this fix closes.
+# Redirect to /dev/null when mktemp fails, rather than to an empty path, which
+# bash reports as an ambiguous redirect on the lookup. The trap is set ONLY
+# when mktemp succeeded: an unconditional trap would run `rm -f /dev/null`,
+# which under root removes the device node and turns every later redirect to
+# /dev/null on that host into a regular file.
+if TRACKER_ERR=$(mktemp); then
+  trap 'rm -f "$TRACKER_ERR"' EXIT
+else
+  TRACKER_ERR=/dev/null
+fi
+
 if command -v tracker_view >/dev/null 2>&1; then
-  ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TICKET_REPO" 2>/dev/null)
+  ISSUE_JSON=$(tracker_view "$TICKET_NUM" "$TICKET_REPO" 2>"$TRACKER_ERR")
 else
   # Library missing (should not happen in a real fork) — fall back to gh so the
   # gate still functions on a GitHub tracker rather than bricking, normalising
   # to the same shape tracker_view emits (labels as a flat string array).
-  ISSUE_JSON=$(gh issue view "$TICKET_NUM" --repo "$TICKET_REPO" --json state,title,url,labels,body 2>/dev/null \
+  ISSUE_JSON=$(gh issue view "$TICKET_NUM" --repo "$TICKET_REPO" --json state,title,url,labels,body 2>"$TRACKER_ERR" \
     | jq -c '{state,title,url,labels:((.labels // []) | map(.name)),body}' 2>/dev/null)
 fi
 
@@ -592,6 +625,10 @@ warrants a hard stop.) If your tracker is untracked, set tracker.kind=none.
 Check your tracker auth (e.g. gh auth status / glab auth status), or run
 /migration to create a new ticket.
 MSG
+  if [ -s "$TRACKER_ERR" ]; then
+    echo "Tracker CLI said:" >&2
+    sed 's/^/  /' "$TRACKER_ERR" >&2
+  fi
   exit 2
 fi
 
