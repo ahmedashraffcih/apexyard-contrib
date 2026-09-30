@@ -37,7 +37,7 @@ FOREIGN_TITLE="feat: merge tuple_file contents into store validation"
 BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |'
 
 make_sandbox() {
-  local external_json="$1" registry_repo="${2:-}"
+  local external_json="$1" registry_repo="${2:-}" registry_shape="${3:-scalar}"
   local sb
   sb=$(mktemp -d)
   (
@@ -52,8 +52,12 @@ make_sandbox() {
     git commit -q -m "init"
   )
   mkdir -p "$sb/.claude/hooks"
+  # _lib-multi-repo-trace.sh carries the registry parser the registry-wins rail
+  # depends on. Without it the hook fails closed and every exemption case
+  # blocks, which is correct behaviour and a broken fixture.
   for lib in validate-pr-create.sh _lib-read-config.sh _lib-tracker.sh \
-             _lib-ops-root.sh _lib-portfolio-paths.sh _lib-extract-pr.sh; do
+             _lib-ops-root.sh _lib-portfolio-paths.sh _lib-extract-pr.sh \
+             _lib-multi-repo-trace.sh; do
     [ -f "$SRC_ROOT/.claude/hooks/$lib" ] && cp "$SRC_ROOT/.claude/hooks/$lib" "$sb/.claude/hooks/$lib"
   done
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"
@@ -62,9 +66,20 @@ make_sandbox() {
   # Adopter override carrying the external list under test.
   printf '{ "external_contributions": %s }\n' "$external_json" > "$sb/.claude/project-config.json"
 
-  # Registry: empty unless a repo is meant to be governed.
+  # Registry: empty unless a repo is meant to be governed. Every shape the
+  # framework supports is exercised, because the first version of the
+  # registry-wins rail matched only two of them (#1451 B2).
   if [ -n "$registry_repo" ]; then
-    printf 'version: 1\nprojects:\n  - name: governed\n    repo: %s\n' "$registry_repo" > "$sb/apexyard.projects.yaml"
+    case "$registry_shape" in
+      scalar)
+        printf 'version: 1\nprojects:\n  - name: governed\n    repo: %s\n' "$registry_repo" ;;
+      comment)
+        printf 'version: 1\nprojects:\n  - name: governed\n    repo: %s  # main app\n' "$registry_repo" ;;
+      inline)
+        printf 'version: 1\nprojects:\n  - name: governed\n    repos: [%s, fork-org/other]\n' "$registry_repo" ;;
+      block)
+        printf 'version: 1\nprojects:\n  - name: governed\n    repos:\n      - %s\n      - fork-org/other\n' "$registry_repo" ;;
+    esac > "$sb/apexyard.projects.yaml"
   else
     printf 'version: 1\nprojects: []\n' > "$sb/apexyard.projects.yaml"
   fi
@@ -72,13 +87,21 @@ make_sandbox() {
 }
 
 run_case() {
-  local label="$1" external_json="$2" target_repo="$3" want_rc="$4" want_regex="${5:-}" registry_repo="${6:-}"
-  local sb; sb=$(make_sandbox "$external_json" "$registry_repo")
+  local label="$1" external_json="$2" target_repo="$3" want_rc="$4" want_regex="${5:-}" \
+        registry_repo="${6:-}" registry_shape="${7:-scalar}" raw_cmd="${8:-}" branch="${9:-}"
+  local sb; sb=$(make_sandbox "$external_json" "$registry_repo" "$registry_shape")
   local body_file="$sb/body.md"
   printf '%s' "$BODY" > "$body_file"
+  if [ -n "$branch" ]; then
+    git -C "$sb" checkout -q -B "$branch" 2>/dev/null
+  fi
 
   local cmd
-  if [ -n "$target_repo" ]; then
+  if [ -n "$raw_cmd" ]; then
+    # A caller-supplied command shape, for the ambiguous-target probes. BODY_FILE
+    # is substituted so the body check is not what trips the validator.
+    cmd=${raw_cmd//BODY_FILE/$body_file}
+  elif [ -n "$target_repo" ]; then
     cmd=$(printf 'gh pr create --repo %s --title "%s" --body-file %s' "$target_repo" "$FOREIGN_TITLE" "$body_file")
   else
     cmd=$(printf 'gh pr create --title "%s" --body-file %s' "$FOREIGN_TITLE" "$body_file")
@@ -138,6 +161,48 @@ run_case "case-insensitive slug match" \
 #    external target to match, so normal validation applies.
 run_case "no --repo means no exemption" \
   '["openfga/vscode-ext"]' "" 2 "doesn't match format"
+
+# --- #1451 B2: every registry shape must win over the list ----------------
+# The first version matched `repo: x` and a block `repos:` list only, so an
+# inline list or a trailing comment silently lost the rail.
+run_case "registry wins — trailing comment" \
+  '["fork-org/governed-app"]' "fork-org/governed-app" 2 "doesn't match format" \
+  "fork-org/governed-app" "comment"
+run_case "registry wins — inline repos list" \
+  '["fork-org/governed-app"]' "fork-org/governed-app" 2 "doesn't match format" \
+  "fork-org/governed-app" "inline"
+run_case "registry wins — block repos list" \
+  '["fork-org/governed-app"]' "fork-org/governed-app" 2 "doesn't match format" \
+  "fork-org/governed-app" "block"
+
+# --- #1451 B1: an ambiguous target must fail closed -----------------------
+# CMD_REPO comes from a quote-blind parser, so a listed slug inside the title
+# or body can be read as the target. The real destination would then be the
+# governed cwd repo, with the title check removed. Fail closed instead.
+run_case "listed slug in the title, no --repo flag" \
+  '["openfga/vscode-ext"]' "" 2 "doesn't match format" "" "scalar" \
+  'gh pr create --title "fix: port --repo openfga/vscode-ext flag" --body-file BODY_FILE'
+run_case "two --repo tokens is ambiguous" \
+  '["openfga/vscode-ext"]' "" 2 "doesn't match format" "" "scalar" \
+  'gh pr create --repo fork-org/governed-app --title "t" --body-file BODY_FILE --repo openfga/vscode-ext'
+# The mirror of the case above: once quoted spans are blanked, a slug that is
+# merely MENTIONED in the title cannot be mistaken for the target, and a real
+# --repo flag still grants the exemption. Asserting this keeps the B1 fix from
+# being over-tightened into refusing legitimate commands.
+run_case "slug mentioned in the title does not defeat a real flag" \
+  '["openfga/vscode-ext"]' "" 0 "external_contributions" "" "scalar" \
+  'gh pr create --repo openfga/vscode-ext --title "sync openfga/vscode-ext docs" --body-file BODY_FILE'
+
+# --- #1451 B3: a plain upstream branch name must be accepted --------------
+# The branch ticket-ID check refused a listed target until it was gated too.
+# The original test passed only because its fixture branch happened to carry a
+# framework ticket ID.
+run_case "plain branch name on a listed target" \
+  '["openfga/vscode-ext"]' "openfga/vscode-ext" 0 "external_contributions" \
+  "" "scalar" "" "fix-tuple-merge"
+run_case "plain branch name still blocked when unlisted" \
+  '[]' "openfga/vscode-ext" 2 "missing ticket ID" \
+  "" "scalar" "" "fix-tuple-merge"
 
 echo
 echo "==================================="
