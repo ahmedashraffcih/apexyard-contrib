@@ -410,10 +410,77 @@ fi
 CHECKS_OUTPUT=$(gh pr checks "$PR_NUMBER" $REPO_FLAG 2>&1)
 CHECKS_RC=$?
 
-# "no checks reported on the 'X' branch" — legitimate no-CI state. Allow.
-# Projects without CI (or branches without the expected workflow wiring)
-# hit this path. Log a single-line note so the user knows the gate was a no-op.
+# "no checks reported on the 'X' branch" — gh prints this for TWO different
+# states, and only one of them is safe to allow (#1519):
+#
+#   1. The repo genuinely has no CI. Allowing is correct and is this branch's
+#      original intent.
+#   2. A fork PR whose workflow run is waiting at GitHub's "Approve and run
+#      workflows" gate. CI IS configured and has never run for this head, so
+#      allowing defeats the gate's whole purpose — and the note below claimed
+#      the opposite of the truth.
+#
+# Observed in the wild: a PR with five active workflows, a run at
+# `action_required` for its head, and `gh pr checks` reporting nothing. A
+# force-push re-arms that gate even after a maintainer approved an earlier
+# head, so this is not only a first-contribution state.
+#
+# Both extra calls only run on this already-rare path, and each degrades to the
+# previous behaviour when it cannot answer: an unreachable or unparseable API
+# result leaves WORKFLOW_COUNT / GATED empty and falls through to the allow, so
+# a network failure cannot turn this into a new refusal.
 if echo "$CHECKS_OUTPUT" | grep -q "no checks reported"; then
+  # Workflow runs live in the BASE repo, which is what `--repo` names on a
+  # merge command and what the cwd repo is when the flag is absent.
+  GATE_OWNER_REPO="$CMD_REPO"
+  if [ -z "$GATE_OWNER_REPO" ]; then
+    GATE_OWNER_REPO=$(gh repo view --json nameWithOwner --jq '.nameWithOwner' 2>/dev/null)
+  fi
+  GATE_HEAD_SHA=$(gh pr view "$PR_NUMBER" $REPO_FLAG --json headRefOid --jq '.headRefOid' 2>/dev/null)
+
+  # Either unresolvable: fall through to the pre-#1519 allow. A hook that
+  # cannot identify the repo or the head must not invent a new refusal.
+  if [ -z "$GATE_OWNER_REPO" ] || [ -z "$GATE_HEAD_SHA" ]; then
+    echo "NOTE: PR #${PR_NUMBER} reports no CI checks, and the repo or head SHA could not be resolved to check for a gated workflow run. Merge-on-red-CI gate is a no-op for this PR." >&2
+    exit 0
+  fi
+
+  WORKFLOW_COUNT=$(gh api "repos/${GATE_OWNER_REPO}/actions/workflows" \
+    --jq '[.workflows[]? | select(.state == "active")] | length' 2>/dev/null)
+
+  if [ -n "$WORKFLOW_COUNT" ] && [ "$WORKFLOW_COUNT" -gt 0 ] 2>/dev/null; then
+    # CI is configured. Is this head's run sitting at the approval gate?
+    GATED=$(gh api "repos/${GATE_OWNER_REPO}/actions/runs?head_sha=${GATE_HEAD_SHA}" \
+      --jq '[.workflow_runs[]? | select(.conclusion == "action_required")] | length' 2>/dev/null)
+
+    if [ -n "$GATED" ] && [ "$GATED" -gt 0 ] 2>/dev/null; then
+      cat >&2 <<MSG
+BLOCKED: PR #${PR_NUMBER} reports no CI checks, but its workflow run is waiting
+for approval.
+
+The repo has ${WORKFLOW_COUNT} active workflow(s), and ${GATED} run(s) for
+${GATE_HEAD_SHA} are at \`action_required\` — GitHub's "Approve and run
+workflows" gate for a pull request from a fork. CI is configured and has NOT
+validated this head, so there is no green result to merge on.
+
+To unblock:
+  1. Approve the workflow run on the PR's Checks tab, or via
+     gh api -X POST repos/${GATE_OWNER_REPO}/actions/runs/<run-id>/approve
+  2. Wait for the checks to finish
+  3. Retry the merge
+
+A force-push re-arms this gate even after an earlier head was approved.
+MSG
+      exit 1
+    fi
+
+    # Workflows exist but none ran for this head. Path or branch filters make
+    # that legitimate, so this stays an allow — but it must not claim the repo
+    # has no CI, which is the misleading half of #1519.
+    echo "NOTE: PR #${PR_NUMBER} reports no CI checks, though the repo has ${WORKFLOW_COUNT} active workflow(s) — no run matched this head (path or branch filters, most likely). Merge-on-red-CI gate is a no-op for this PR; no CI result validated this head." >&2
+    exit 0
+  fi
+
   echo "NOTE: PR #${PR_NUMBER} has no CI checks configured. Merge-on-red-CI gate is a no-op for this PR." >&2
   exit 0
 fi
