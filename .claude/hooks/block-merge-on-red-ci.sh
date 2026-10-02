@@ -25,12 +25,16 @@
 # Uses `gh pr checks <pr>` which returns one line per check with status.
 # Exit codes:
 #   0 = all checks passed (and none required are missing)
-#   1 = at least one check failed, was cancelled, or skipped
-#   8 = no checks at all
+#   1 = at least one check failed, was cancelled, or skipped; also the
+#       no-checks case ("no checks reported on the '<branch>' branch")
+#   8 = at least one check is pending
 #
 # The hook allows:
 #   - exit 0 (all green)
-#   - exit 8 if the repo has no CI (gh pr checks returns "no checks" — allow)
+#   - non-zero exit whose entire trimmed stdout/stderr is exactly
+#     `no checks reported on the '<branch>' branch` (repo has no CI —
+#     allow). Substring match is NOT enough: check names can contain
+#     that phrase (#1523).
 # Blocks:
 #   - exit 1 (red CI)
 #   - any check with state FAILURE | CANCELLED | TIMED_OUT
@@ -96,7 +100,8 @@ INPUT=$(cat)
 # status, not on approval markers — so only _lib-extract-pr.sh is guarded
 # here.
 _require_lib() {
-  local lib="$1"
+  local lib="$1" fn
+  shift
   if [ ! -r "$lib" ]; then
     echo "BLOCKED: merge gate cannot load a required library." >&2
     echo "Missing or unreadable: $lib" >&2
@@ -112,6 +117,12 @@ _require_lib() {
     echo "instead of skipping the check. Fix the file and retry." >&2
     exit 2
   fi
+  for fn in "$@"; do
+    if ! command -v "$fn" >/dev/null 2>&1 || ! declare -F "$fn" >/dev/null 2>&1; then
+      printf 'BLOCKED: merge gate missing required function %s after sourcing %s. Restore the library and retry.\n' "$fn" "$lib" >&2
+      exit 2
+    fi
+  done
 }
 
 # Shared merge-shape detector + PR-number parser (see _lib-extract-pr.sh).
@@ -121,7 +132,10 @@ _require_lib() {
 # original position after the parse) so is_merge_command is available as
 # the jq-independent fallback detector when the parse can't be trusted —
 # see #965.
-_require_lib "$(dirname "$0")/_lib-extract-pr.sh"
+_require_lib "$(dirname "$0")/_lib-extract-pr.sh" \
+  is_merge_command is_merge_command_raw _scrub_merge_command _normalize_json_escapes \
+  merge_command_uses_variable extract_pr_number resolve_merge_repo \
+  resolve_ci_status_glab
 # Leading cd-target recovery for shared merge-repo resolution (#687/#1151).
 # Optional only for standalone hook-test sandboxes that copy a minimal lib set.
 if [ -f "$(dirname "$0")/_lib-pr-repo.sh" ]; then
@@ -271,7 +285,7 @@ if [ -z "$COMMAND" ]; then
   # hook sees. A payload that DOES look merge-shaped but that we can't
   # safely parse/verify fails CLOSED (exit 2) instead of silently letting
   # an ungated merge through with an unverified CI status.
-  if is_merge_command "$(_normalize_json_escapes "$INPUT")"; then
+  if is_merge_command_raw "$(_normalize_json_escapes "$INPUT")"; then
     echo "BLOCKED: CI gate cannot evaluate this command — jq is unavailable or .tool_input.command could not be parsed, but the raw input looks merge-related. Refusing to merge until CI status can be verified. Restore jq (see .claude/hooks/check-jq-installed.sh) and retry." >&2
     exit 2
   fi
@@ -404,32 +418,44 @@ MSG
 fi
 
 # --- GitHub path (unchanged, byte-identical to pre-#790 behaviour) ---
-# Query checks. gh pr checks returns text output; we check both the exit code
-# and a "no checks reported" substring — the latter is how gh reports the
-# genuinely-unchecked case regardless of exit code version.
+# Query checks. gh pr checks returns text output; we check both the exit
+# code and whether the whole trimmed output is the CLI's exact no-checks
+# message (#1523 — a substring match wrongly allowed a check NAME that
+# contained "no checks reported").
 CHECKS_OUTPUT=$(gh pr checks "$PR_NUMBER" $REPO_FLAG 2>&1)
 CHECKS_RC=$?
 
-# "no checks reported on the 'X' branch" — gh prints this for TWO different
-# states, and only one of them is safe to allow (#1519):
+# "no checks reported on the 'X' branch" — allow only when BOTH: checks
+# exited non-zero, AND the entire trimmed output matches that exact CLI
+# message. A substring match is not enough, because a contributor controls
+# check names and a `pull_request` run uses the PR's own workflow files
+# (#1523).
 #
-#   1. The repo genuinely has no CI. Allowing is correct and is this branch's
+# Reaching here means gh reported no checks. That still covers TWO states,
+# and only one is safe to allow (#1519):
+#
+#   1. The repo genuinely has no CI. Allowing is correct and is this arm's
 #      original intent.
-#   2. A fork PR whose workflow run is waiting at GitHub's "Approve and run
+#   2. A fork PR whose workflow run waits at GitHub's "Approve and run
 #      workflows" gate. CI IS configured and has never run for this head, so
-#      allowing defeats the gate's whole purpose — and the note below claimed
-#      the opposite of the truth.
+#      allowing defeats the gate — and the note below used to claim the
+#      opposite of the truth.
 #
 # Observed in the wild: a PR with five active workflows, a run at
 # `action_required` for its head, and `gh pr checks` reporting nothing. A
 # force-push re-arms that gate even after a maintainer approved an earlier
 # head, so this is not only a first-contribution state.
 #
-# Both extra calls only run on this already-rare path, and each degrades to the
-# previous behaviour when it cannot answer: an unreachable or unparseable API
-# result leaves WORKFLOW_COUNT / GATED empty and falls through to the allow, so
-# a network failure cannot turn this into a new refusal.
-if echo "$CHECKS_OUTPUT" | grep -q "no checks reported"; then
+# Every unresolvable value below falls through to the pre-#1519 allow. A hook
+# that cannot identify the repo or the head must not invent a refusal, so a
+# 403, a rate limit or a network fault cannot turn this into a new block.
+_checks_trimmed="${CHECKS_OUTPUT#"${CHECKS_OUTPUT%%[![:space:]]*}"}"
+_checks_trimmed="${_checks_trimmed%"${_checks_trimmed##*[![:space:]]}"}"
+# [^[:cntrl:]] and not .: in bash =~, . also matches a newline, so a
+# multi-line check list that starts and ends with the right text would
+# match. Branch names cannot contain control characters.
+_no_checks_re="^no checks reported on the '[^[:cntrl:]]*' branch$"
+if [ "$CHECKS_RC" -ne 0 ] && [[ "$_checks_trimmed" =~ $_no_checks_re ]]; then
   # Workflow runs live in the BASE repo, which is what `--repo` names on a
   # merge command and what the cwd repo is when the flag is absent.
   GATE_OWNER_REPO="$CMD_REPO"
@@ -438,8 +464,6 @@ if echo "$CHECKS_OUTPUT" | grep -q "no checks reported"; then
   fi
   GATE_HEAD_SHA=$(gh pr view "$PR_NUMBER" $REPO_FLAG --json headRefOid --jq '.headRefOid' 2>/dev/null)
 
-  # Either unresolvable: fall through to the pre-#1519 allow. A hook that
-  # cannot identify the repo or the head must not invent a new refusal.
   if [ -z "$GATE_OWNER_REPO" ] || [ -z "$GATE_HEAD_SHA" ]; then
     echo "NOTE: PR #${PR_NUMBER} reports no CI checks, and the repo or head SHA could not be resolved to check for a gated workflow run. Merge-on-red-CI gate is a no-op for this PR." >&2
     exit 0
@@ -449,9 +473,11 @@ if echo "$CHECKS_OUTPUT" | grep -q "no checks reported"; then
     --jq '[.workflows[]? | select(.state == "active")] | length' 2>/dev/null)
 
   if [ -n "$WORKFLOW_COUNT" ] && [ "$WORKFLOW_COUNT" -gt 0 ] 2>/dev/null; then
-    # CI is configured. Is this head's run sitting at the approval gate?
-    GATED=$(gh api "repos/${GATE_OWNER_REPO}/actions/runs?head_sha=${GATE_HEAD_SHA}" \
-      --jq '[.workflow_runs[]? | select(.conclusion == "action_required")] | length' 2>/dev/null)
+    # `status=action_required` filters server-side and `.total_count` is the
+    # unpaginated total, so a head with more than one page of runs cannot
+    # push the gated ones out of view (#1520 review, A4).
+    GATED=$(gh api "repos/${GATE_OWNER_REPO}/actions/runs?head_sha=${GATE_HEAD_SHA}&status=action_required" \
+      --jq '.total_count' 2>/dev/null)
 
     if [ -n "$GATED" ] && [ "$GATED" -gt 0 ] 2>/dev/null; then
       cat >&2 <<MSG
@@ -471,7 +497,12 @@ To unblock:
 
 A force-push re-arms this gate even after an earlier head was approved.
 MSG
-      exit 1
+      # exit 2, not 1: Claude Code blocks a PreToolUse call only on exit 2.
+      # The dispatcher maps 1 to 2 today, but a direct hook wiring would read
+      # exit 1 as a warning and let the merge run — so a "block" that exits 1
+      # is not reliably a block. Every other refusal in this hook exits 2
+      # (#1520 review, A6).
+      exit 2
     fi
 
     # Workflows exist but none ran for this head. Path or branch filters make

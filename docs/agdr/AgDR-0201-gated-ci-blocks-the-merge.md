@@ -23,6 +23,12 @@ Observed on a real public PR the author has open as an outside contributor: five
 
 Rail 1 of `.claude/rules/agdr-decisions.md` makes any change to `.claude/hooks/**` material, and this changes a gate's verdict.
 
+### Relationship to #1523
+
+Issue #1523 landed on `dev` while this work was in review, and fixed a different defect in the same branch: the guard matched `no checks reported` as a **substring**, so a contributor-controlled check *name* containing that phrase sent a red PR down the allow path. It now requires a non-zero exit and an exact whole-output match.
+
+The two are orthogonal and compose. That change tightened **when** this arm is entered; this decision is about **what to do once inside it**. Verified after merging `dev`: with #1523's guard in place, the gated-workflow case still exits 0 and allows the merge, and 5 of this change's 6 cases still fail against current `dev`.
+
 ## Options Considered
 
 | Option | Pros | Cons |
@@ -39,7 +45,9 @@ Chosen: **(d)**.
 When, and only when, `gh pr checks` reports no checks:
 
 1. Count active workflows in the **base** repo. Zero means no CI — allow, with the original note, unchanged.
-2. Non-zero, and a run for the head SHA has conclusion `action_required` — **block**, exit 1, naming the approval gate and how to clear it.
+2. Non-zero, and a run for the head SHA is at `action_required` — **block**, exit **2**, naming the approval gate and how to clear it. Exit 2, not 1: Claude Code blocks a `PreToolUse` call only on exit 2, and while the dispatcher maps 1 to 2 today, a direct hook wiring would read exit 1 as a warning and let the merge run. A "block" that exits 1 is not reliably a block. Every other refusal in this hook exits 2.
+
+   The query is `actions/runs?head_sha=<sha>&status=action_required`, read as `.total_count`. Filtering server-side and taking the unpaginated total means a head with more than one page of runs cannot push the gated ones out of view.
 3. Non-zero with no such run — allow, but the note says workflows exist and no run matched this head, rather than claiming there is no CI.
 4. Either value unresolvable — allow, with a note saying so. A hook that cannot identify the repo or the head must not invent a refusal.
 

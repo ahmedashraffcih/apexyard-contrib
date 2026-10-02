@@ -12,6 +12,7 @@ HOOKS="${HOOKS_OVERRIDE:-$ROOT/.claude/hooks}"
 SNAP_HOOKS="${SNAP_HOOKS:-}"
 CONFIG_DEFAULTS="${CONFIG_DEFAULTS_OVERRIDE:-$ROOT/.claude/project-config.defaults.json}"
 TMP=$(mktemp -d)
+export GIT_CEILING_DIRECTORIES="$TMP"
 trap 'rm -rf "$TMP"' EXIT
 pass=0
 fail=0
@@ -72,6 +73,9 @@ setup_dispatch_sandbox() {
   cp "$hooks_src/dispatch-bash.sh" "$dest/hooks/dispatch-bash.sh"
   [ -f "$hooks_src/_lib-extract-pr.sh" ] && cp "$hooks_src/_lib-extract-pr.sh" "$dest/hooks/_lib-extract-pr.sh"
   [ -f "$hooks_src/_lib-command-scrub.sh" ] && cp "$hooks_src/_lib-command-scrub.sh" "$dest/hooks/_lib-command-scrub.sh"
+  # _lib-extract-pr.sh sources the tracker library. Copy it so the sandbox
+  # does not depend on finding it through the surrounding git checkout.
+  [ -f "$hooks_src/_lib-tracker.sh" ] && cp "$hooks_src/_lib-tracker.sh" "$dest/hooks/_lib-tracker.sh"
   chmod +x "$dest/hooks/dispatch-bash.sh"
   local script
   for script in block-ambient-tracker-repo.sh block-privileged-escalation.sh \
@@ -146,29 +150,31 @@ archive_snapshot() {
   return 1
 }
 
-SNAP_ARCHIVE="$TMP/39c5b95"
-D5_ARCHIVE="$TMP/d5e7ce4"
-HEAD_ARCHIVE="$TMP/1fea730"
+# Full 40-character SHAs for the reviewed PR #1466 snapshots (AgDR-0207).
+# Short prefixes can become ambiguous as history grows.
+SNAP_ARCHIVE="$TMP/39c5b959f0544785c643c6945b487ec579b4a035"
+D5_ARCHIVE="$TMP/d5e7ce4d50e07bd0bd026230e1fb78714e809a27"
+HEAD_ARCHIVE="$TMP/1fea7308d0a6de4412198b1bc645ada8a47a8f05"
 if [ "${REQUIRE_SNAPSHOTS:-0}" != "1" ] && [ -n "$SNAP_HOOKS" ] \
     && [ -f "$SNAP_HOOKS/require-active-ticket.sh" ]; then
   :
-elif archive_snapshot 39c5b95 "$SNAP_ARCHIVE"; then
+elif archive_snapshot 39c5b959f0544785c643c6945b487ec579b4a035 "$SNAP_ARCHIVE"; then
   SNAP_HOOKS="$SNAP_ARCHIVE/.claude/hooks"
 else
   SNAP_HOOKS=""
-  missing_snapshot 39c5b95
+  missing_snapshot 39c5b959f0544785c643c6945b487ec579b4a035
 fi
-if archive_snapshot d5e7ce4 "$D5_ARCHIVE"; then
+if archive_snapshot d5e7ce4d50e07bd0bd026230e1fb78714e809a27 "$D5_ARCHIVE"; then
   D5_HOOKS="$D5_ARCHIVE/.claude/hooks"
 else
   D5_HOOKS=""
-  missing_snapshot d5e7ce4
+  missing_snapshot d5e7ce4d50e07bd0bd026230e1fb78714e809a27
 fi
-if archive_snapshot 1fea730 "$HEAD_ARCHIVE"; then
+if archive_snapshot 1fea7308d0a6de4412198b1bc645ada8a47a8f05 "$HEAD_ARCHIVE"; then
   HEAD_HOOKS="$HEAD_ARCHIVE/.claude/hooks"
 else
   HEAD_HOOKS=""
-  missing_snapshot 1fea730
+  missing_snapshot 1fea7308d0a6de4412198b1bc645ada8a47a8f05
 fi
 
 if [ "${SNAPSHOT_PREFLIGHT_ONLY:-0}" = "1" ]; then
@@ -465,6 +471,16 @@ if [ -d "$SNAP_HOOKS" ] && [ -f "$SNAP_HOOKS/dispatch-bash.sh" ]; then
     n=$((n + 1))
   done
 fi
+
+# #1489 review regressions. Do not apply these to the historical #1459 proof.
+add_merge 'F1.1 echo then quoted API' "echo checking; gh api -X PUT 'repos/me2resh/apexyard/pulls/1497/merge' -f merge_method=squash"
+add_merge 'F1.2 grep then quoted API' 'grep -q ok status.txt && gh api --method PUT "repos/o/r/pulls/7/merge"'
+add_merge 'F1.3 quoted API then echo line' $'gh api -X PUT "repos/o/r/pulls/7/merge" -f merge_method=squash\necho merged'
+add_merge 'F1.4 cd API then echo line' $'cd /x && gh api -X PUT "repos/o/r/pulls/7/merge"\necho done'
+add_merge 'F2.1 rg preprocessor payload' "echo 'gh pr merge 7 --squash' > m.sh; rg --pre sh . m.sh"
+add_merge 'F2.2 git hook payload' "echo x; echo 'gh pr merge 7 --squash' > .git/hooks/pre-commit; git commit --allow-empty -m x"
+add_merge 'F2.3 git external diff payload' "echo '[diff]' >> .git/config; echo 'external = sh -c \"gh pr merge 7\" #' >> .git/config; git diff"
+add_merge 'sort compressor payload' "echo 'gh pr merge 7' > m.sh; sort --compress-program=./m.sh input.txt"
 
 setup_dispatch_sandbox "$TMP/cur_dispatch" "$HOOKS"
 n=1
