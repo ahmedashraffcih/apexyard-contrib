@@ -1,4 +1,4 @@
-# AgDR-0201 — A gated workflow run blocks the merge; a repo with no CI still does not
+# AgDR-0212 — A gated workflow run blocks the merge; a repo with no CI still does not
 
 > In the context of `block-merge-on-red-ci.sh`, facing `gh pr checks` printing the identical "no checks reported" line for a repo with no CI and for a fork PR whose workflow waits at GitHub's approval gate, I decided to distinguish the two with the Actions API and refuse only the `action_required` case, to close a fail-open in a merge gate without introducing false refusals, accepting two extra API calls on an already-rare path and a residual state the gate still cannot see.
 
