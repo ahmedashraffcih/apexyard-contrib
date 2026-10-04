@@ -28,6 +28,11 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 # Test isolation: don't let a live session pin escape onto the real fork.
 unset APEXYARD_OPS_PIN_DIR CLAUDE_CODE_SESSION_ID 2>/dev/null || true
 export APEXYARD_OPS_DISABLE_PIN=1
@@ -1599,6 +1604,62 @@ for tilde in '~root' '~+' '~-'; do
   rm -f "$STDERR_FILE"
   rm -rf "$SB"
 done
+
+# =============================================================================
+# Cases #1483: relative migrations/ spellings must all block without a ticket.
+# Default patterns are `*/`-anchored, so bare `migrations/001.sql` used to
+# miss every arm while `./migrations/001.sql` matched. Cover Bash redirects
+# and Write/Edit file_path for the three relative spellings named in the
+# ticket. No active migration ticket → exit 2 for each.
+# =============================================================================
+for _1483_spelling in \
+  'migrations/001.sql' \
+  './migrations/001.sql' \
+  'sub/../migrations/001.sql'
+do
+  SB=$(make_fork)
+  mkdir -p "$SB/migrations" "$SB/sub"
+  install_mock "$SB" gh 'exit 99'
+  if run_hook_bash "$SB" "echo x > $_1483_spelling" 2; then
+    record_pass "#1483 bash: relative '$_1483_spelling' with no ticket → block"
+  else
+    record_fail "#1483 bash: relative '$_1483_spelling' with no ticket → block"
+  fi
+  rm -rf "$SB"
+done
+
+for _1483_spelling in \
+  'migrations/001.sql' \
+  './migrations/001.sql' \
+  'sub/../migrations/001.sql'
+do
+  SB=$(make_fork)
+  mkdir -p "$SB/migrations" "$SB/sub"
+  install_mock "$SB" gh 'exit 99'
+  if run_hook "$SB" "$_1483_spelling" 2; then
+    record_pass "#1483 Write: relative '$_1483_spelling' with no ticket → block"
+  else
+    record_fail "#1483 Write: relative '$_1483_spelling' with no ticket → block"
+  fi
+  rm -rf "$SB"
+done
+
+# --- #1502 (review of PR #1516): a sed `w` migration file next to an
+# interpreter write must still reach this gate. The extractor held such a
+# target back, and this gate exits 0 on an empty list. No ticket: block.
+SB=$(make_fork)
+for c in \
+  "python3.12 -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -W error::ResourceWarning -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -c \"open('x','w').write('y')\" && sed -n 'w migrations/001_add_table.sql' in.txt" \
+  "python3 -c \"open('x','w').write('y')\" ; sed -n 'w migrations/001_add_table.sql' in.txt"; do
+  if run_hook_bash "$SB" "$c" 2; then
+    record_pass "#1502 sed w migration target next to an interpreter write blocks: $c"
+  else
+    record_fail "#1502 sed w migration target next to an interpreter write blocks: $c"
+  fi
+done
+rm -rf "$SB"
 
 # =============================================================================
 # Summary
