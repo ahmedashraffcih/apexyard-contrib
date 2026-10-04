@@ -149,6 +149,73 @@ printf 'local only\n' > "$FORK/.claude/hooks/adopter-only.sh"
 commit_in "$FORK" "adopter-only hook"
 assert_silent "file absent upstream is silent" "$(hook_drift_notice "$FORK/.claude/hooks/adopter-only.sh")"
 
+# --- gate + sourced libs (Rex B-1 / motivating case) -----------------------
+# A mini gate that sources `_lib-active-ticket.sh` via `$ACTIVE_TICKET_LIB`,
+# the same shape `require-active-ticket.sh` uses. Lib names must come from
+# the gate's source lines, not a hardcoded list.
+GUP="$TMP/gateup"
+mkdir -p "$GUP/.claude/hooks"
+g "$GUP" init -q
+cat > "$GUP/.claude/hooks/sample-gate.sh" <<'GATE'
+#!/bin/bash
+ACTIVE_TICKET_LIB="$(dirname "$0")/_lib-active-ticket.sh"
+. "$ACTIVE_TICKET_LIB"
+GATE
+printf 'lib-v1\n' > "$GUP/.claude/hooks/_lib-active-ticket.sh"
+printf 'gate-v1\n' >> "$GUP/.claude/hooks/sample-gate.sh"
+commit_in "$GUP" "add gate+lib"
+g "$GUP" branch -M main
+
+GFORK="$TMP/gatefork"
+git clone -q "$GUP" "$GFORK" 2>/dev/null
+g "$GFORK" remote add upstream "$GUP"
+g "$GFORK" fetch upstream
+
+# 9. Only the sourced lib is stale: one note, names the lib (not a silent miss).
+printf 'lib-v2\n' > "$GUP/.claude/hooks/_lib-active-ticket.sh"
+commit_in "$GUP" "fix the lib only"
+g "$GFORK" fetch upstream
+out=$(hook_drift_notice_for_gate "$GFORK/.claude/hooks/sample-gate.sh")
+assert_mentions "lib-only stale names the lib" "$out" ".claude/hooks/_lib-active-ticket.sh"
+assert_mentions "lib-only stale says changed"  "$out" "has changed since your version"
+case "$out" in
+  *".claude/hooks/sample-gate.sh"*)
+    bad "lib-only does not name the current gate" "gate was named though only the lib changed: $out"
+    ;;
+  *)
+    ok "lib-only does not name the current gate"
+    ;;
+esac
+note_count=$(printf '%s' "$out" | grep -c '^Note:' || true)
+if [ "$note_count" -eq 1 ]; then
+  ok "lib-only is one note"
+else
+  bad "lib-only is one note" "expected 1 Note: line, got $note_count"
+fi
+
+# 10. Gate and a sourced lib are both stale: one note, both files listed.
+printf 'gate-v2\n' >> "$GUP/.claude/hooks/sample-gate.sh"
+printf 'lib-v3\n' > "$GUP/.claude/hooks/_lib-active-ticket.sh"
+commit_in "$GUP" "fix gate and lib"
+g "$GFORK" fetch upstream
+out=$(hook_drift_notice_for_gate "$GFORK/.claude/hooks/sample-gate.sh")
+assert_mentions "both-stale names the gate" "$out" ".claude/hooks/sample-gate.sh"
+assert_mentions "both-stale names the lib"  "$out" ".claude/hooks/_lib-active-ticket.sh"
+note_count=$(printf '%s' "$out" | grep -c '^Note:' || true)
+if [ "$note_count" -eq 1 ]; then
+  ok "both-stale is one note"
+else
+  bad "both-stale is one note" "expected 1 Note: line, got $note_count"
+fi
+case "$out" in
+  *"those files have changed"*) ok "both-stale uses plural wording" ;;
+  *) bad "both-stale uses plural wording" "got: $out" ;;
+esac
+
+# 11. Gate and sourced lib both current: no note.
+g "$GFORK" reset --hard upstream/main
+assert_silent "gate+lib current is silent" "$(hook_drift_notice_for_gate "$GFORK/.claude/hooks/sample-gate.sh")"
+
 echo
 echo "==================================="
 echo "  PASS: $PASS   FAIL: $FAIL"

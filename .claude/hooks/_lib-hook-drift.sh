@@ -9,9 +9,16 @@
 # investigate the hook, or file a bug against it, against a copy upstream may
 # have already fixed.
 #
-# `hook_drift_notice <hook-file>` prints one short paragraph when the fork's
-# copy of that file differs from upstream's, and prints nothing otherwise.
-# Callers append it to a refusal message they were printing anyway.
+# `hook_drift_notice <file> [<file>...]` prints one short paragraph when any
+# of the listed files differs from upstream's copy, and prints nothing
+# otherwise. Callers append it to a refusal message they were printing anyway.
+#
+# `hook_drift_notice_for_gate <gate-file>` is the call site used by a gate. It
+# checks the gate itself plus every `.claude/hooks/_lib-*.sh` the gate sources.
+# The lib list is derived from the gate's `source` / `.` lines (including a
+# `$VAR` source whose assignment in the same file names a `_lib-*.sh`), not
+# from a hardcoded list. That is what covers the motivating case: a stale
+# `_lib-active-ticket.sh` behind an unchanged `require-active-ticket.sh`.
 #
 # It compares BLOB CONTENT, not commit ancestry. An earlier revision counted
 # `git rev-list HEAD..<ref> -- <path>` and that was unsound: releases reach
@@ -39,10 +46,29 @@
 #   - It names no commit count. Under squash releases a count cannot be made
 #     to mean anything reliable, so the message describes the file instead.
 #
+# Known silent false negatives (never false notes): a fork that tracks `dev`
+# while a local `upstream/main` exists stays silent, because `main` never
+# shipped its blob. A shallow fork whose version is older than the shallow
+# boundary also stays silent — `--find-object` cannot see a blob the shallow
+# clone never fetched.
+#
 # Advisory only. Every failure path returns 0 and prints nothing: a gate must
 # refuse or permit on its own logic, never on whether this helper worked.
 
-hook_drift_notice() {
+# Every git call the helper makes, with the two environment guards applied in
+# one place. GIT_NO_LAZY_FETCH (git 2.45+) stops a path-limited read in a
+# treeless partial clone from fetching missing objects from the promisor
+# remote; GIT_TERMINAL_PROMPT=0 stops any such attempt from blocking on
+# credentials. Both matter because this runs inside a PreToolUse hook.
+_hd_git() {
+  local wd="$1"
+  shift
+  GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git -C "$wd" "$@" 2>/dev/null
+}
+
+# Echo the repo-relative path when <file> is a shipped-but-behind upstream
+# copy. Echo nothing otherwise. Always returns 0.
+_hd_stale_rel() {
   local hook_file="$1"
   [ -n "$hook_file" ] || return 0
   [ -f "$hook_file" ] || return 0
@@ -97,23 +123,140 @@ hook_drift_notice() {
   shipped=$(_hd_git "$root" log -1 --format=%H --find-object="$fork_blob" "$ref" -- "$rel")
   [ -n "$shipped" ] || return 0
 
+  printf '%s\n' "$rel"
+}
+
+# From a `.` / `source` argument, emit a `_lib-*.sh` basename when one is
+# named on the line, or when a bare `$VAR` / `${VAR}` resolves to an
+# assignment in <script> that names one.
+_hd_lib_basename_from_source_arg() {
+  local script="$1" arg="$2"
+  local var assign
+
+  # Strip surrounding quotes.
+  case "$arg" in
+    \"*\") arg=${arg#\"}; arg=${arg%\"} ;;
+    \'*\') arg=${arg#\'}; arg=${arg%\'} ;;
+  esac
+
+  case "$arg" in
+    *_lib-*.sh*)
+      printf '%s' "$arg" | sed -n 's/.*\(_lib-[A-Za-z0-9_-]*\.sh\).*/\1/p'
+      return 0
+      ;;
+  esac
+
+  case "$arg" in
+    \$\{[A-Za-z_][A-Za-z0-9_]*\})
+      var=${arg#\$\{}
+      var=${var%\}}
+      ;;
+    \$[A-Za-z_][A-Za-z0-9_]*)
+      var=${arg#\$}
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+  [ -n "$var" ] || return 0
+
+  # Last assignment of VAR (or `local VAR=...`) in the same file.
+  assign=$(grep -E "^[[:space:]]*(local[[:space:]]+)?${var}=" "$script" 2>/dev/null | tail -n 1) || true
+  [ -n "$assign" ] || return 0
+  case "$assign" in
+    *_lib-*.sh*)
+      printf '%s' "$assign" | sed -n 's/.*\(_lib-[A-Za-z0-9_-]*\.sh\).*/\1/p'
+      ;;
+  esac
+}
+
+# Emit unique `_lib-*.sh` basenames sourced by <script>, derived from its
+# `source` / `.` lines. Not a hardcoded list.
+_hd_source_lib_basenames() {
+  local script="$1"
+  [ -f "$script" ] || return 0
+
+  local tok base seen
+  seen=$'\n'
+  # Collect `.` / `source` arguments. Inline comments after the path are
+  # stripped; `#` inside the path itself does not appear in these hooks.
+  while IFS= read -r tok || [ -n "$tok" ]; do
+    [ -n "$tok" ] || continue
+    base=$(_hd_lib_basename_from_source_arg "$script" "$tok")
+    [ -n "$base" ] || continue
+    case "$seen" in
+      *$'\n'"$base"$'\n'*) continue ;;
+    esac
+    seen="${seen}${base}"$'\n'
+    printf '%s\n' "$base"
+  done <<EOF
+$(awk '
+  /^[[:space:]]*(\.|source)[[:space:]]+/ {
+    line = $0
+    sub(/^[[:space:]]*(\.|source)[[:space:]]+/, "", line)
+    if (match(line, /[[:space:]]+#/)) {
+      line = substr(line, 1, RSTART - 1)
+    }
+    sub(/[[:space:]]+$/, "", line)
+    if (length(line) > 0) print line
+  }
+' "$script")
+EOF
+}
+
+# Print one note listing every listed file that is a shipped-but-behind
+# upstream copy. Accepts one or more paths. Always returns 0.
+hook_drift_notice() {
+  local stale_rels='' rel f n list file_clause
+
+  for f in "$@"; do
+    rel=$(_hd_stale_rel "$f")
+    [ -n "$rel" ] || continue
+    case $'\n'"$stale_rels" in
+      *$'\n'"$rel"$'\n'*) ;;
+      *) stale_rels="${stale_rels}${rel}"$'\n' ;;
+    esac
+  done
+  [ -n "$stale_rels" ] || return 0
+
+  list=$(printf '%s' "$stale_rels" | sed '/^$/d' | sed 's/^/  /')
+  n=$(printf '%s' "$stale_rels" | sed '/^$/d' | wc -l | tr -d ' ')
+  if [ "$n" -eq 1 ]; then
+    file_clause="and upstream's copy of that file has changed since your version."
+  else
+    file_clause="and upstream's copies of those files have changed since your version."
+  fi
+
   cat <<MSG
 
 Note: this refusal came from your fork's copy of
-  $rel
-and upstream's copy of that file has changed since your version. It may
+$list
+${file_clause} It may
 already be fixed. Run /update before investigating the hook or filing a bug
 against it.
 MSG
 }
 
-# Every git call the helper makes, with the two environment guards applied in
-# one place. GIT_NO_LAZY_FETCH (git 2.45+) stops a path-limited read in a
-# treeless partial clone from fetching missing objects from the promisor
-# remote; GIT_TERMINAL_PROMPT=0 stops any such attempt from blocking on
-# credentials. Both matter because this runs inside a PreToolUse hook.
-_hd_git() {
-  local wd="$1"
-  shift
-  GIT_NO_LAZY_FETCH=1 GIT_TERMINAL_PROMPT=0 git -C "$wd" "$@" 2>/dev/null
+# Check <gate-file> and every `.claude/hooks/_lib-*.sh` it sources. Lib names
+# come from the gate's own `source` / `.` lines (see _hd_source_lib_basenames).
+hook_drift_notice_for_gate() {
+  local gate="$1"
+  [ -n "$gate" ] || return 0
+  [ -f "$gate" ] || return 0
+
+  local dir base path
+  dir=$(CDPATH='' cd -- "$(dirname -- "$gate")" 2>/dev/null && pwd -P) || return 0
+
+  # Positional list starts with the gate; append each unique existing lib.
+  set -- "$gate"
+  while IFS= read -r base || [ -n "$base" ]; do
+    [ -n "$base" ] || continue
+    path="$dir/$base"
+    [ -f "$path" ] || continue
+    set -- "$@" "$path"
+  done <<EOF
+$(_hd_source_lib_basenames "$gate")
+EOF
+
+  hook_drift_notice "$@"
 }
