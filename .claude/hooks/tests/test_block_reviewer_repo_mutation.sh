@@ -3,6 +3,11 @@
 # active-reviewer marker is present.
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
+
 SRC_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 HOOK="$SRC_ROOT/.claude/hooks/block-reviewer-repo-mutation.sh"
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/apexyard-review-mutation.XXXXXX")
@@ -198,6 +203,25 @@ if [ "$rc" -eq 0 ] && printf '%s' "$output" | grep -q 'ADVISORY:' && printf '%s'
   echo "PASS: #1400 LOW3: legacy shared-path marker + a session id -> non-blocking stderr advisory, commit still allowed"
 else
   echo "FAIL: #1400 LOW3: legacy shared-path marker + a session id -> non-blocking stderr advisory, commit still allowed (rc=$rc output=$output)" >&2
+  trap - EXIT
+  rm -rf "$TMP" "$SESS_TMP"
+  exit 1
+fi
+
+# (7) me2resh/apexyard#1408 — the #1400 advisory must not print on every Bash
+# call. A read-only command such as `ls` stays silent even when a legacy shared
+# marker file is still on disk.
+input=$(jq -cn --arg command 'ls' '{tool_input:{command:$command}}')
+output=$(
+  cd "$SESS_TMP" || exit 1
+  export CLAUDE_CODE_SESSION_ID="sess-E"
+  printf '%s' "$input" | "$SESS_TMP/.claude/hooks/block-reviewer-repo-mutation.sh" 2>&1
+)
+rc=$?
+if [ "$rc" -eq 0 ] && ! printf '%s' "$output" | grep -q 'ADVISORY:'; then
+  echo "PASS: #1408: legacy shared-path marker + session id + read-only ls -> silent (no advisory spam)"
+else
+  echo "FAIL: #1408: legacy shared-path marker + session id + read-only ls -> silent (rc=$rc output=$output)" >&2
   trap - EXIT
   rm -rf "$TMP" "$SESS_TMP"
   exit 1
