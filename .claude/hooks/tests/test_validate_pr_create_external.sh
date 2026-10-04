@@ -20,6 +20,10 @@
 
 set -u
 
+# Isolate from live Claude Code session pin/cache (me2resh/apexyard#1549).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/_test-session-isolation.sh"
+
 HOOK_SRC="$(cd "$(dirname "$0")/.." && pwd)/validate-pr-create.sh"
 if [ ! -x "$HOOK_SRC" ]; then
   echo "FAIL: hook not found or not executable at $HOOK_SRC" >&2
@@ -34,7 +38,10 @@ SRC_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 # A title that is correct for an upstream project and wrong for this framework:
 # no ticket in parentheses, which is exactly what the convention requires.
 FOREIGN_TITLE="feat: merge tuple_file contents into store validation"
-BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |'
+# Minimal PR body with Summary / Testing / Glossary plus a Refs line so the
+# AgDR-0202 completeness check is not what trips the validator (same shape as
+# test_validate_pr_create_upstream.sh).
+BODY=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |\n\nRefs #1448'
 
 make_sandbox() {
   local external_json="$1" registry_repo="${2:-}" registry_shape="${3:-scalar}"
@@ -55,9 +62,13 @@ make_sandbox() {
   # _lib-multi-repo-trace.sh carries the registry parser the registry-wins rail
   # depends on. Without it the hook fails closed and every exemption case
   # blocks, which is correct behaviour and a broken fixture.
+  # _lib-review-markers.sh owns AgDR-0202 body completeness; missing it makes
+  # the hook exit 2 with "review validator unavailable" before any title or
+  # exemption assertion can succeed (same requirement as head/upstream tests).
+  # _lib-pr-repo.sh is the canonical --repo / --head / cd-target parser.
   for lib in validate-pr-create.sh _lib-read-config.sh _lib-tracker.sh \
              _lib-ops-root.sh _lib-portfolio-paths.sh _lib-extract-pr.sh \
-             _lib-multi-repo-trace.sh; do
+             _lib-multi-repo-trace.sh _lib-review-markers.sh _lib-pr-repo.sh; do
     [ -f "$SRC_ROOT/.claude/hooks/$lib" ] && cp "$SRC_ROOT/.claude/hooks/$lib" "$sb/.claude/hooks/$lib"
   done
   chmod +x "$sb/.claude/hooks/validate-pr-create.sh"

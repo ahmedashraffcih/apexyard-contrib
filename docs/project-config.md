@@ -148,6 +148,7 @@ Three properties worth knowing:
 - **Convention only.** This relaxes a *convention* check. Leak protection,
   secret scanning, and every security control are unaffected — they arguably
   matter more here, since these repositories are usually public.
+
 ### Pre-merge QA offer
 
 Set `qa.pre_merge_offer` in `.claude/project-config.json` to one of these values:
