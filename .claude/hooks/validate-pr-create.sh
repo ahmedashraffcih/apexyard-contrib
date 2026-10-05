@@ -201,11 +201,13 @@ while [ "$_gate_iter" -lt 10 ]; do
   # structural change from round 1 (which ran all four shapes every
   # iteration, unconditionally) to round 2 (check-then-strip).
 
-  # 1. cd <path> && / ; / | -- quoted or bare path.
+  # 1. cd <path> && / || / ; / | -- quoted or bare path.
+  #    Match `||` before `|` so a double-pipe chain is not left with a
+  #    leading `|` that hides a later `gh pr create` (#1451 B1-c).
   _stripped=$(printf '%s' "$_cmd_head" | sed -E \
-    "s/^[[:space:]]*cd[[:space:]]+\"[^\"]+\"[[:space:]]*(&&|;|\|)[[:space:]]*//;
-     s/^[[:space:]]*cd[[:space:]]+'[^']+'[[:space:]]*(&&|;|\|)[[:space:]]*//;
-     s/^[[:space:]]*cd[[:space:]]+[^&;|[:space:]]+[[:space:]]*(&&|;|\|)[[:space:]]*//")
+    "s/^[[:space:]]*cd[[:space:]]+\"[^\"]+\"[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//;
+     s/^[[:space:]]*cd[[:space:]]+'[^']+'[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//;
+     s/^[[:space:]]*cd[[:space:]]+[^&;|[:space:]]+[[:space:]]*(&&|\|\||;|\|)[[:space:]]*//")
   if [ "$_stripped" != "$_cmd_head" ]; then
     _cmd_head="$_stripped"
   else
@@ -224,9 +226,9 @@ while [ "$_gate_iter" -lt 10 ]; do
         # 4. A quote-free arbitrary segment followed by a top-level
         #    separator — last resort, only tried once shapes 1-3 (and the
         #    verb-check above) have already failed to match this
-        #    iteration's head.
+        #    iteration's head. `||` before `|` (same as shape 1).
         _cmd_head=$(printf '%s' "$_cmd_head" | sed -E \
-          "s/^[[:space:]]*[^\"'&;|]+(&&|;|\|)[[:space:]]*//")
+          "s/^[[:space:]]*[^\"'&;|]+(&&|\|\||;|\|)[[:space:]]*//")
       fi
     fi
   fi
@@ -314,7 +316,7 @@ fi
 # this list would quietly disable title validation for work the framework is
 # supposed to be governing, which is a gate relaxation dressed up as config.
 #
-# Helpers for this block only (#1451 B1-b / B2-b).
+# Helpers for this block only (#1451 B1-b / B1-c / B2-b / A-2).
 
 # Normalise a repo reference to lowercase owner/name. Strips scheme,
 # git@host:, bare host/, trailing .git, and trailing /. Echoes nothing when
@@ -332,6 +334,41 @@ _vpc_normalize_repo_slug() {
   fi
 }
 
+# Echo the PR-create SEGMENT of a quote-blanked first line (#1451 B1-c).
+# Starts at the `gh pr create` invocation and ends at the next top-level
+# `&&`, `||`, `;`, `|`, or end of line. A trailing unquoted `#` comment
+# (a `#` that starts a shell word) is stripped so a comment mentioning
+# `--repo` cannot grant the exemption. Echoes nothing when no create verb
+# is present on the line.
+_vpc_pr_create_segment() {
+  # Portable word-boundary after "create": macOS awk (nawk) has no `\b`.
+  printf '%s' "$1" | awk '
+    {
+      line = $0
+      if (!match(line, /(^|[[:space:]])gh[[:space:]]+pr[[:space:]]+create([^a-zA-Z0-9_]|$)/)) next
+      start = RSTART
+      if (substr(line, start, 1) ~ /[[:space:]]/) start++
+      seg = substr(line, start)
+      out = ""
+      n = length(seg)
+      i = 1
+      while (i <= n) {
+        two = substr(seg, i, 2)
+        if (two == "&&" || two == "||") break
+        c = substr(seg, i, 1)
+        if (c == ";" || c == "|") break
+        out = out c
+        i++
+      }
+      if (match(out, /(^|[[:space:]])#/)) {
+        if (RSTART == 1) out = ""
+        else out = substr(out, 1, RSTART - 1)
+      }
+      print out
+    }
+  '
+}
+
 EXTERNAL_TARGET=""
 if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
   # CMD_REPO is pr_cmd_target_repo's continuation-joined parse — the repo
@@ -340,15 +377,19 @@ if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
   # wins rail never fires.
   _vpc_repo_lc=$(_vpc_normalize_repo_slug "$CMD_REPO")
 
-  # FAIL CLOSED on an ambiguous / body-injected target (#1451 B1 / B1-b).
+  # FAIL CLOSED on an ambiguous / body-injected target (#1451 B1 / B1-b / B1-c).
   # Quote-blanking is line-oriented, so a multi-line --body heredoc left a
   # `--repo` token on a later line visible to a whole-command scan, and
   # CMD_REPO could be set from body text while the real create targeted the
-  # governed cwd. Take the exemption candidate ONLY from the command's first
-  # line (the actual pr-create invocation), with quoted spans blanked there,
-  # and require that candidate to equal CMD_REPO after the same normalisation.
-  # Reuse pr_cmd_target_repo for the first-line value so there is one parser.
-  # If the first-line target cannot be resolved unambiguously, no exemption.
+  # governed cwd. Take the exemption candidate ONLY from the PR-create
+  # SEGMENT of the command's first line (from `gh pr create` to the next
+  # unquoted `&&` / `||` / `;` / `|` / newline, with trailing `#` comments
+  # stripped), with quoted spans blanked there, and require that candidate
+  # to equal CMD_REPO after the same normalisation. A prior `gh pr view
+  # --repo … &&` or a trailing `# … --repo …` comment must not grant the
+  # exemption. Reuse pr_cmd_target_repo for the segment value so there is
+  # one parser. If the segment target cannot be resolved unambiguously,
+  # no exemption.
   _vpc_ambiguous=""
   if [ -z "$_vpc_repo_lc" ]; then
     # CMD_REPO did not normalise to owner/name — cannot match the list safely.
@@ -357,37 +398,42 @@ if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
     _vpc_first_line=$(printf '%s\n' "$COMMAND" | head -n 1)
     _vpc_first_unquoted=$(printf '%s' "$_vpc_first_line" \
       | sed -E 's/"[^"]*"/""/g; s/'"'"'[^'"'"']*'"'"'/'"''"'/g')
-    # Exactly one --repo/-R flag on the first line, outside quotes.
-    _vpc_repo_tokens=$(printf '%s\n' "$_vpc_first_unquoted" \
-      | grep -oE '(^|[[:space:]])(--repo|-R)([[:space:]]+|=)' | wc -l | tr -d ' ')
-    if [ "${_vpc_repo_tokens:-0}" != "1" ]; then
+    _vpc_create_seg=$(_vpc_pr_create_segment "$_vpc_first_unquoted")
+    if [ -z "$_vpc_create_seg" ]; then
       _vpc_ambiguous="1"
     else
-      _vpc_first_repo=""
-      if command -v pr_cmd_target_repo >/dev/null 2>&1; then
-        # Leading space satisfies pr_cmd_target_repo's flag-boundary sed.
-        _vpc_first_repo=$(pr_cmd_target_repo " ${_vpc_first_unquoted}")
-      else
-        _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
-          | sed -nE 's/.*[[:space:]]--repo[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
-        if [ -z "$_vpc_first_repo" ]; then
-          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
-            | sed -nE 's/.*[[:space:]]--repo=([^[:space:]]+).*/\1/p' | head -1)
-        fi
-        if [ -z "$_vpc_first_repo" ]; then
-          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
-            | sed -nE 's/.*[[:space:]]-R[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
-        fi
-        if [ -z "$_vpc_first_repo" ]; then
-          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
-            | sed -nE 's/.*[[:space:]]-R=([^[:space:]]+).*/\1/p' | head -1)
-        fi
-      fi
-      _vpc_first_repo_lc=$(_vpc_normalize_repo_slug "$_vpc_first_repo")
-      # Must equal the CLI target. A body-only --repo makes CMD_REPO non-empty
-      # while the first line has none (or a different flag) — refuse.
-      if [ -z "$_vpc_first_repo_lc" ] || [ "$_vpc_first_repo_lc" != "$_vpc_repo_lc" ]; then
+      # Exactly one --repo/-R flag on the create segment, outside quotes.
+      _vpc_repo_tokens=$(printf '%s\n' "$_vpc_create_seg" \
+        | grep -oE '(^|[[:space:]])(--repo|-R)([[:space:]]+|=)' | wc -l | tr -d ' ')
+      if [ "${_vpc_repo_tokens:-0}" != "1" ]; then
         _vpc_ambiguous="1"
+      else
+        _vpc_first_repo=""
+        if command -v pr_cmd_target_repo >/dev/null 2>&1; then
+          # Leading space satisfies pr_cmd_target_repo's flag-boundary sed.
+          _vpc_first_repo=$(pr_cmd_target_repo " ${_vpc_create_seg}")
+        else
+          _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+            | sed -nE 's/.*[[:space:]]--repo[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]--repo=([^[:space:]]+).*/\1/p' | head -1)
+          fi
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]-R[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+          fi
+          if [ -z "$_vpc_first_repo" ]; then
+            _vpc_first_repo=$(printf '%s' "$_vpc_create_seg" \
+              | sed -nE 's/.*[[:space:]]-R=([^[:space:]]+).*/\1/p' | head -1)
+          fi
+        fi
+        _vpc_first_repo_lc=$(_vpc_normalize_repo_slug "$_vpc_first_repo")
+        # Must equal the CLI target. A body-only --repo makes CMD_REPO non-empty
+        # while the create segment has none (or a different flag) — refuse.
+        if [ -z "$_vpc_first_repo_lc" ] || [ "$_vpc_first_repo_lc" != "$_vpc_repo_lc" ]; then
+          _vpc_ambiguous="1"
+        fi
       fi
     fi
   fi
@@ -437,11 +483,21 @@ $_vpc_repo_lc
     fi
 
     if [ -z "$_vpc_governed" ]; then
+      # A-2: listing this checkout's own origin must not disable the local
+      # title check. Resolve origin once; ignore matching list entries.
+      _vpc_origin_lc=""
+      if command -v git_origin_repo >/dev/null 2>&1; then
+        _vpc_origin_lc=$(_vpc_normalize_repo_slug "$(git_origin_repo "$PWD" 2>/dev/null || true)")
+      fi
       while IFS= read -r _vpc_listed; do
         [ -n "$_vpc_listed" ] || continue
         _vpc_listed_lc=$(_vpc_normalize_repo_slug "$_vpc_listed")
         if [ -z "$_vpc_listed_lc" ]; then
           echo "NOTE: validate-pr-create.sh: ignoring external_contributions entry '$_vpc_listed' (not owner/name after normalisation)." >&2
+          continue
+        fi
+        if [ -n "$_vpc_origin_lc" ] && [ "$_vpc_listed_lc" = "$_vpc_origin_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring external_contributions entry '$_vpc_listed' (matches this checkout's origin; cannot disable the local title check)." >&2
           continue
         fi
         if [ "$_vpc_listed_lc" = "$_vpc_repo_lc" ]; then
@@ -454,8 +510,9 @@ EOF
     fi
   fi
   unset _vpc_repo_lc _vpc_ambiguous _vpc_first_line _vpc_first_unquoted \
-        _vpc_repo_tokens _vpc_first_repo _vpc_first_repo_lc _vpc_governed \
-        _vpc_all_repos _vpc_reg_raw _vpc_reg_lc _vpc_listed _vpc_listed_lc
+        _vpc_create_seg _vpc_repo_tokens _vpc_first_repo _vpc_first_repo_lc \
+        _vpc_governed _vpc_all_repos _vpc_reg_raw _vpc_reg_lc _vpc_listed \
+        _vpc_listed_lc _vpc_origin_lc
 fi
 
 TICKET_REF=""

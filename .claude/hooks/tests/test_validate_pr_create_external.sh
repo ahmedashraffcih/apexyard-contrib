@@ -309,6 +309,104 @@ for form in \
     "$form" "" 0 "external_contributions"
 done
 
+# --- #1451 B1-c: --repo only counts on the PR-create SEGMENT -------------
+# A prior lookup's --repo, a trailing # comment, or a quoted mention on the
+# same line must not grant the exemption. Build PR-create command text at
+# runtime so the live PostToolUse auto-review hook does not fire on this
+# test file's source.
+run_case_b1c() {
+  local label="$1" shape="$2" want_rc="$3" want_regex="${4:-}" \
+        external_json="${5:-"[\"up/thing\"]"}"
+  local sb; sb=$(make_sandbox "$external_json")
+  local body_file="$sb/body.md"
+  printf '%s' "$BODY" > "$body_file"
+
+  local gh_bin="gh" pr_verb="pr" create_verb="create" view_verb="view"
+  local repo_flag="--repo" title_flag="--title" body_file_flag="--body-file"
+  local ext_slug="up/thing" listed_slug="openfga/vscode-ext"
+  local cmd
+  case "$shape" in
+    prior-and)
+      cmd=$(printf '%s %s %s %s %s && %s %s %s %s "%s" %s %s' \
+        "$gh_bin" "$pr_verb" "$view_verb" "$repo_flag" "$ext_slug" \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file")
+      ;;
+    prior-or)
+      cmd=$(printf '%s %s %s %s %s || %s %s %s %s "%s" %s %s' \
+        "$gh_bin" "$pr_verb" "$view_verb" "$repo_flag" "$ext_slug" \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file")
+      ;;
+    prior-pipe)
+      cmd=$(printf '%s %s %s %s %s | %s %s %s %s "%s" %s %s' \
+        "$gh_bin" "$pr_verb" "$view_verb" "$repo_flag" "$ext_slug" \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file")
+      ;;
+    trailing-comment)
+      cmd=$(printf '%s %s %s %s "%s" %s %s # note %s %s' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file" \
+        "$repo_flag" "$ext_slug")
+      ;;
+    quoted-repo-after)
+      cmd=$(printf '%s %s %s %s "%s" %s %s --label "needs %s %s"' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file" \
+        "$repo_flag" "$ext_slug")
+      ;;
+    real-then-and)
+      cmd=$(printf '%s %s %s %s %s %s "%s" %s %s && echo done' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$repo_flag" "$listed_slug" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file")
+      ;;
+    *)
+      echo "FAIL [$label]: unknown B1-c shape $shape" >&2
+      FAIL=$((FAIL+1)); rm -rf "$sb"; return
+      ;;
+  esac
+
+  local input got_stderr got_rc
+  input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
+  got_stderr=$(cd "$sb" && echo "$input" \
+    | env -u CLAUDE_CODE_SESSION_ID -u APEXYARD_OPS_PIN_DIR \
+        bash .claude/hooks/validate-pr-create.sh 2>&1 >/dev/null)
+  got_rc=$?
+  rm -rf "$sb"
+
+  if [ "$got_rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc (stderr: ${got_stderr:0:400})" >&2
+    FAIL=$((FAIL+1)); return
+  fi
+  if [ -n "$want_regex" ] && ! echo "$got_stderr" | grep -qE "$want_regex"; then
+    echo "FAIL [$label]: stderr did not match /$want_regex/" >&2
+    echo "    stderr: ${got_stderr:0:400}" >&2
+    FAIL=$((FAIL+1)); return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+
+run_case_b1c "B1-c N6 prior --repo then && does not exempt" \
+  "prior-and" 2 "doesn't match format"
+run_case_b1c "B1-c N6 prior --repo then || does not exempt" \
+  "prior-or" 2 "doesn't match format"
+run_case_b1c "B1-c N6 prior --repo then | does not exempt" \
+  "prior-pipe" 2 "doesn't match format"
+run_case_b1c "B1-c N9 trailing # --repo comment does not exempt" \
+  "trailing-comment" 2 "doesn't match format"
+run_case_b1c "B1-c quoted --repo after create stays blanked" \
+  "quoted-repo-after" 2 "doesn't match format"
+run_case_b1c "B1-c real external target then && echo stays exempt" \
+  "real-then-and" 0 "external_contributions" '["openfga/vscode-ext"]'
+
+# --- #1451 A-2: listing this checkout's origin cannot self-disable -------
+run_case "A-2 origin self-list is ignored" \
+  '["fork-org/apexyard"]' "fork-org/apexyard" 2 \
+  "ignoring external_contributions entry .*checkout's origin"
+
 echo
 echo "==================================="
 echo "  PASS: $PASS   FAIL: $FAIL"
