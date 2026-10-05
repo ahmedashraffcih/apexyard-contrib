@@ -313,42 +313,83 @@ fi
 # not apply however the list is written — otherwise adding a governed repo to
 # this list would quietly disable title validation for work the framework is
 # supposed to be governing, which is a gate relaxation dressed up as config.
+#
+# Helpers for this block only (#1451 B1-b / B2-b).
+
+# Normalise a repo reference to lowercase owner/name. Strips scheme,
+# git@host:, bare host/, trailing .git, and trailing /. Echoes nothing when
+# the result is not exactly owner/name (caller decides whether to warn).
+_vpc_normalize_repo_slug() {
+  local s
+  s=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  s=$(printf '%s' "$s" | sed -E 's|^[a-z][a-z0-9+.-]*://||')
+  s=$(printf '%s' "$s" | sed -E 's|^git@[^:]+:||')
+  s=$(printf '%s' "$s" | sed -E 's|^[a-z0-9.-]+\.[a-z]{2,}/||')
+  s=$(printf '%s' "$s" | sed -E 's|\.git$||')
+  s=$(printf '%s' "$s" | sed -E 's|/$||')
+  if printf '%s' "$s" | grep -qE '^[^/]+/[^/]+$'; then
+    printf '%s' "$s"
+  fi
+}
+
 EXTERNAL_TARGET=""
 if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
-  _vpc_repo_lc=$(printf '%s' "$CMD_REPO" | tr '[:upper:]' '[:lower:]')
+  # CMD_REPO is pr_cmd_target_repo's continuation-joined parse — the repo
+  # the CLI will actually use. Normalise it before any list/registry match
+  # (#1451 B2-b): URL and SSH forms must become owner/name or the registry-
+  # wins rail never fires.
+  _vpc_repo_lc=$(_vpc_normalize_repo_slug "$CMD_REPO")
 
-  # FAIL CLOSED on an ambiguous target (#1451 B1). `CMD_REPO` comes from a
-  # quote-blind parser: it reads a `--repo` token anywhere in the command,
-  # including inside the quoted --title or --body value. Before this
-  # exemption existed a wrong CMD_REPO only mis-aimed the ticket lookup;
-  # here it would REMOVE the title check from a PR whose real target is the
-  # governed cwd repo. A PR body that quotes an upstream command makes that
-  # shape likely, and a body is an injection surface besides.
-  #
-  # So the exemption requires an unambiguous parse: exactly one --repo/-R
-  # token in the whole command, and the parsed slug must not also appear in
-  # the title or body text, where it could be the thing that was parsed.
-  # Blank out every quoted span, so what remains is the command's real flags.
-  # A --repo that survives this is a flag; one that disappears was text inside
-  # --title or --body. Escaped quotes make this imperfect, which is why the
-  # result is only ever used to REFUSE an exemption, never to grant one on its
-  # own.
-  _vpc_unquoted=$(printf '%s' "$COMMAND" | sed -E 's/"[^"]*"/""/g; s/'"'"'[^'"'"']*'"'"'/'"''"'/g')
-
+  # FAIL CLOSED on an ambiguous / body-injected target (#1451 B1 / B1-b).
+  # Quote-blanking is line-oriented, so a multi-line --body heredoc left a
+  # `--repo` token on a later line visible to a whole-command scan, and
+  # CMD_REPO could be set from body text while the real create targeted the
+  # governed cwd. Take the exemption candidate ONLY from the command's first
+  # line (the actual pr-create invocation), with quoted spans blanked there,
+  # and require that candidate to equal CMD_REPO after the same normalisation.
+  # Reuse pr_cmd_target_repo for the first-line value so there is one parser.
+  # If the first-line target cannot be resolved unambiguously, no exemption.
   _vpc_ambiguous=""
-  # Exactly one --repo/-R flag, counted outside quoted text.
-  _vpc_repo_tokens=$(printf '%s\n' "$_vpc_unquoted" \
-    | grep -oE '(^|[[:space:]])(--repo|-R)([[:space:]]+|=)' | wc -l | tr -d ' ')
-  [ "${_vpc_repo_tokens:-0}" = "1" ] || _vpc_ambiguous="1"
-  # And the parsed slug must be the value of that flag, still outside quotes.
-  # This is what catches the probe in #1451 B1: a title reading
-  # `fix: port --repo <listed-slug> flag` has one --repo token and one slug
-  # occurrence, but both vanish with the quoted span, so the real target is
-  # the cwd repo and the exemption must not apply.
-  if [ -z "$_vpc_ambiguous" ]; then
-    printf '%s\n' "$_vpc_unquoted" \
-      | grep -qiE "(^|[[:space:]])(--repo|-R)([[:space:]]+|=)[\"']?([a-z0-9.-]+\.[a-z]{2,}/)?${_vpc_repo_lc}([[:space:]]|\$|[\"'])" \
-      || _vpc_ambiguous="1"
+  if [ -z "$_vpc_repo_lc" ]; then
+    # CMD_REPO did not normalise to owner/name — cannot match the list safely.
+    _vpc_ambiguous="1"
+  else
+    _vpc_first_line=$(printf '%s\n' "$COMMAND" | head -n 1)
+    _vpc_first_unquoted=$(printf '%s' "$_vpc_first_line" \
+      | sed -E 's/"[^"]*"/""/g; s/'"'"'[^'"'"']*'"'"'/'"''"'/g')
+    # Exactly one --repo/-R flag on the first line, outside quotes.
+    _vpc_repo_tokens=$(printf '%s\n' "$_vpc_first_unquoted" \
+      | grep -oE '(^|[[:space:]])(--repo|-R)([[:space:]]+|=)' | wc -l | tr -d ' ')
+    if [ "${_vpc_repo_tokens:-0}" != "1" ]; then
+      _vpc_ambiguous="1"
+    else
+      _vpc_first_repo=""
+      if command -v pr_cmd_target_repo >/dev/null 2>&1; then
+        # Leading space satisfies pr_cmd_target_repo's flag-boundary sed.
+        _vpc_first_repo=$(pr_cmd_target_repo " ${_vpc_first_unquoted}")
+      else
+        _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
+          | sed -nE 's/.*[[:space:]]--repo[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+        if [ -z "$_vpc_first_repo" ]; then
+          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
+            | sed -nE 's/.*[[:space:]]--repo=([^[:space:]]+).*/\1/p' | head -1)
+        fi
+        if [ -z "$_vpc_first_repo" ]; then
+          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
+            | sed -nE 's/.*[[:space:]]-R[[:space:]]+([^[:space:]]+).*/\1/p' | head -1)
+        fi
+        if [ -z "$_vpc_first_repo" ]; then
+          _vpc_first_repo=$(printf '%s' "$_vpc_first_unquoted" \
+            | sed -nE 's/.*[[:space:]]-R=([^[:space:]]+).*/\1/p' | head -1)
+        fi
+      fi
+      _vpc_first_repo_lc=$(_vpc_normalize_repo_slug "$_vpc_first_repo")
+      # Must equal the CLI target. A body-only --repo makes CMD_REPO non-empty
+      # while the first line has none (or a different flag) — refuse.
+      if [ -z "$_vpc_first_repo_lc" ] || [ "$_vpc_first_repo_lc" != "$_vpc_repo_lc" ]; then
+        _vpc_ambiguous="1"
+      fi
+    fi
   fi
 
   if [ -z "$_vpc_ambiguous" ]; then
@@ -357,6 +398,7 @@ if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
     # `repos: [a, b]`, and any of those with a trailing comment (#1451 B2).
     # A hand-rolled grep missed the inline and commented forms, so reuse the
     # registry parser instead — its field 6 lists every repo for an entry.
+    # Compare normalised owner/name slugs (#1451 B2-b).
     _vpc_governed=""
     if [ -f "$HOOK_DIR/_lib-portfolio-paths.sh" ]; then
       # shellcheck disable=SC1090,SC1091
@@ -367,8 +409,19 @@ if [ -n "$CMD_REPO" ] && command -v config_get >/dev/null 2>&1; then
       . "$HOOK_DIR/_lib-multi-repo-trace.sh"
     fi
     if command -v _mrt_parse_registry >/dev/null 2>&1; then
-      _vpc_all_repos=$(_mrt_parse_registry 2>/dev/null | cut -d'|' -f6 | tr ',' '\n' \
-        | tr '[:upper:]' '[:lower:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+      _vpc_all_repos=""
+      while IFS= read -r _vpc_reg_raw; do
+        [ -n "$_vpc_reg_raw" ] || continue
+        _vpc_reg_raw=$(printf '%s' "$_vpc_reg_raw" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+        _vpc_reg_lc=$(_vpc_normalize_repo_slug "$_vpc_reg_raw")
+        if [ -z "$_vpc_reg_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring registry repo entry '$_vpc_reg_raw' (not owner/name after normalisation)." >&2
+          continue
+        fi
+        _vpc_all_repos=$(printf '%s\n%s' "$_vpc_all_repos" "$_vpc_reg_lc")
+      done <<EOF
+$(_mrt_parse_registry 2>/dev/null | cut -d'|' -f6 | tr ',' '\n')
+EOF
       case "
 $_vpc_all_repos
 " in
@@ -386,8 +439,12 @@ $_vpc_repo_lc
     if [ -z "$_vpc_governed" ]; then
       while IFS= read -r _vpc_listed; do
         [ -n "$_vpc_listed" ] || continue
-        _vpc_listed=$(printf '%s' "$_vpc_listed" | tr '[:upper:]' '[:lower:]')
-        if [ "$_vpc_listed" = "$_vpc_repo_lc" ]; then
+        _vpc_listed_lc=$(_vpc_normalize_repo_slug "$_vpc_listed")
+        if [ -z "$_vpc_listed_lc" ]; then
+          echo "NOTE: validate-pr-create.sh: ignoring external_contributions entry '$_vpc_listed' (not owner/name after normalisation)." >&2
+          continue
+        fi
+        if [ "$_vpc_listed_lc" = "$_vpc_repo_lc" ]; then
           EXTERNAL_TARGET="1"
           break
         fi
@@ -396,6 +453,9 @@ $(config_get '.external_contributions[]' 2>/dev/null)
 EOF
     fi
   fi
+  unset _vpc_repo_lc _vpc_ambiguous _vpc_first_line _vpc_first_unquoted \
+        _vpc_repo_tokens _vpc_first_repo _vpc_first_repo_lc _vpc_governed \
+        _vpc_all_repos _vpc_reg_raw _vpc_reg_lc _vpc_listed _vpc_listed_lc
 fi
 
 TICKET_REF=""

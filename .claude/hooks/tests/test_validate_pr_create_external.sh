@@ -215,6 +215,100 @@ run_case "plain branch name still blocked when unlisted" \
   '[]' "openfga/vscode-ext" 2 "missing ticket ID" \
   "" "scalar" "" "fix-tuple-merge"
 
+# --- #1451 B1-b: multi-line body must not grant an exemption --------------
+# Quote-blanking is line-oriented, so a --repo token on a later body line
+# survived the whole-command ambiguity check and made CMD_REPO look like a
+# listed external target while the real create aimed at the cwd. The fix
+# keys the exemption on the command's first line only, and only when that
+# matches pr_cmd_target_repo's continuation-joined result.
+BODY_WITH_REPO=$'## Summary\nx\n\n## Testing\ny\n\n## Glossary\n| t | d |\n\nRefs #1448\n\nSee --repo up/thing for context'
+
+run_case_body_shape() {
+  local label="$1" shape="$2" want_rc="$3" want_regex="${4:-}"
+  local sb; sb=$(make_sandbox '["up/thing"]')
+  local body_file="$sb/body.md"
+  printf '%s' "$BODY_WITH_REPO" > "$body_file"
+
+  # Assemble the PR-create command at runtime inside this test file only.
+  local gh_bin="gh" pr_verb="pr" create_verb="create"
+  local title_flag="--title" body_flag="--body" body_file_flag="--body-file"
+  local cmd
+  case "$shape" in
+    cat-heredoc)
+      cmd=$(printf '%s %s %s %s "%s" %s "$(cat <<EOF\n%s\nEOF\n)"' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_flag" "$BODY_WITH_REPO")
+      ;;
+    stdin-heredoc)
+      cmd=$(printf '%s %s %s %s "%s" %s - <<EOF\n%s\nEOF' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$BODY_WITH_REPO")
+      ;;
+    body-file)
+      cmd=$(printf '%s %s %s %s "%s" %s %s' \
+        "$gh_bin" "$pr_verb" "$create_verb" \
+        "$title_flag" "$FOREIGN_TITLE" "$body_file_flag" "$body_file")
+      ;;
+    *)
+      echo "FAIL [$label]: unknown body shape $shape" >&2
+      FAIL=$((FAIL+1)); rm -rf "$sb"; return
+      ;;
+  esac
+
+  local input got_stderr got_rc
+  input=$(jq -nc --arg c "$cmd" '{tool_input:{command:$c}}')
+  got_stderr=$(cd "$sb" && echo "$input" \
+    | env -u CLAUDE_CODE_SESSION_ID -u APEXYARD_OPS_PIN_DIR \
+        bash .claude/hooks/validate-pr-create.sh 2>&1 >/dev/null)
+  got_rc=$?
+  rm -rf "$sb"
+
+  if [ "$got_rc" != "$want_rc" ]; then
+    echo "FAIL [$label]: want rc=$want_rc, got $got_rc (stderr: ${got_stderr:0:400})" >&2
+    FAIL=$((FAIL+1)); return
+  fi
+  if [ -n "$want_regex" ] && ! echo "$got_stderr" | grep -qE "$want_regex"; then
+    echo "FAIL [$label]: stderr did not match /$want_regex/" >&2
+    echo "    stderr: ${got_stderr:0:400}" >&2
+    FAIL=$((FAIL+1)); return
+  fi
+  echo "PASS [$label]"
+  PASS=$((PASS+1))
+}
+
+run_case_body_shape "B1-b body via cat-heredoc does not exempt" \
+  "cat-heredoc" 2 "doesn't match format"
+run_case_body_shape "B1-b body via stdin-heredoc does not exempt" \
+  "stdin-heredoc" 2 "doesn't match format"
+run_case_body_shape "B1-b --body-file with --repo mention does not exempt" \
+  "body-file" 2 "doesn't match format"
+
+# --- #1451 B2-b: URL / SSH forms must normalise before registry-wins ------
+# Only a bare host/ prefix was stripped, so https://… and git@… forms never
+# matched a registry slug and a governed repo listed in URL form was exempt.
+run_case_url_form() {
+  local label="$1" form="$2" registry_repo="$3" want_rc="$4" want_regex="${5:-}"
+  local external_json
+  external_json=$(printf '["%s"]' "$form")
+  run_case "$label" "$external_json" "$form" "$want_rc" "$want_regex" "$registry_repo"
+}
+
+for form in \
+  'https://github.com/fork-org/governed-app' \
+  'https://github.com/fork-org/governed-app.git' \
+  'git@github.com:fork-org/governed-app.git'; do
+  run_case_url_form "B2-b governed URL form blocked ($form)" \
+    "$form" "fork-org/governed-app" 2 "doesn't match format"
+done
+
+for form in \
+  'https://github.com/openfga/vscode-ext' \
+  'https://github.com/openfga/vscode-ext.git' \
+  'git@github.com:openfga/vscode-ext.git'; do
+  run_case_url_form "B2-b external URL form exempt ($form)" \
+    "$form" "" 0 "external_contributions"
+done
+
 echo
 echo "==================================="
 echo "  PASS: $PASS   FAIL: $FAIL"

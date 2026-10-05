@@ -23,7 +23,7 @@ Rail 1 of `.claude/rules/agdr-decisions.md` makes any change to `.claude/hooks/*
 
 Chosen: **(d)**.
 
-1. **`external_contributions` lives in `.claude/project-config.json`**, an array of `owner/name` slugs matched case-insensitively. The shipped default is `[]`, so a fork that never opts in behaves exactly as before. This mirrors `leak_protection.public_framework_repos`, which already classifies repos for hook behaviour from config.
+1. **`external_contributions` lives in `.claude/project-config.json`**, an array of `owner/name` slugs (or URL / SSH forms that normalise to that) matched after normalisation. The shipped default is `[]`, so a fork that never opts in behaves exactly as before. This mirrors `leak_protection.public_framework_repos`, which already classifies repos for hook behaviour from config.
 
 2. **Scope is the title-shape check and the branch-ticket check**, both inside `validate-pr-create.sh`. #1448 asked for "title and branch conventions"; the branch-ticket check is the branch half that actually fires on a PR-create, and a contributor's branch lives on their own fork under the destination project's naming conventions.
 
@@ -31,15 +31,17 @@ Chosen: **(d)**.
 
 4. **An unreadable registry fails closed.** If the parser is unavailable the target is treated as governed. An unreadable registry must not be indistinguishable from an empty one, because the second grants the exemption.
 
-5. **An ambiguous target fails closed.** `CMD_REPO` comes from a quote-blind parser that reads a `--repo` token anywhere in the command text, including inside the quoted `--title` or `--body`. Before this exemption a wrong `CMD_REPO` only mis-aimed the ticket lookup; here it would remove the gate from a PR whose real target is the governed cwd repo — and a PR body quoting an upstream command is exactly the content this feature makes more likely, as well as an injection surface. So the exemption requires: quoted spans blanked, exactly one `--repo`/`-R` flag remaining, and the parsed slug appearing as that flag's value outside any quoted span. A slug merely *mentioned* in the title does not defeat a real flag.
+5. **An ambiguous target fails closed, keyed on the command's first line (#1451 B1 / B1-b).** `CMD_REPO` comes from `pr_cmd_target_repo` on the continuation-joined command text — a quote-blind parser that can read a `--repo` token from a later body line. Quote-blanking is also line-oriented, so a multi-line `--body "$(cat <<EOF …)"` or stdin heredoc left a body `--repo` visible while the real create targeted the governed cwd. The exemption therefore requires: (a) exactly one `--repo`/`-R` on the **first line** of the command after quoted spans on that line are blanked; (b) that first-line value, resolved with the same `pr_cmd_target_repo` helper, normalises to the same `owner/name` as `CMD_REPO`. If either side cannot be resolved unambiguously, there is no exemption and the normal title/branch gates run. A slug merely *mentioned* in the title does not defeat a real first-line flag.
 
-6. **Security controls are out of scope.** Leak protection, secret scanning, and the private-refs hooks are untouched. They matter more for these repositories, not less, because they are usually public.
+6. **Repo references are normalised to lowercase `owner/name` before comparison (#1451 B2-b).** Both the CLI target and every external-list / registry entry strip scheme, `git@host:`, bare `host/`, trailing `.git`, and trailing `/`. An entry that does not normalise to exactly `owner/name` is ignored (with a stderr note). Without this, `https://github.com/o/r` and `git@github.com:o/r.git` never matched a registry slug, so a governed repo listed in URL form was incorrectly exempted.
+
+7. **Security controls are out of scope.** Leak protection, secret scanning, and the private-refs hooks are untouched. They matter more for these repositories, not less, because they are usually public.
 
 ## Consequences
 
 - An adopter can contribute upstream without a manual bypass, and the exemption is visible in config rather than in someone's shell history.
 - Two places now hold repo knowledge. The registry remains authoritative for "governed"; this list only ever *removes* convention checks, and never overrides the registry.
-- The ambiguity guard is a heuristic over command text, not a parsed argv, so escaped quotes can still defeat the quote-blanking step. It is used only to **refuse** an exemption, never to grant one, so its failure mode is a correct PR being refused rather than a gate being skipped. A structural `gh` argument parser would close it properly; that is a larger change than this exemption warrants.
+- The ambiguity guard is a heuristic over command text, not a parsed argv. It is a **positive grant condition** (first-line target must resolve and equal `CMD_REPO`), not a refuse-only filter: when it cannot decide, the failure mode is still "no exemption" (a correct external PR may be refused) rather than a skipped gate on a governed create. Escaped quotes can still defeat the first-line quote-blanking step; a structural `gh` argument parser would close that properly and is a larger change than this exemption warrants.
 - `validate-branch-name.sh` is unchanged. It fires on push, and a contributor pushes to their own fork, where their own conventions arguably apply. Revisit if an adopter reports being blocked there.
 - The `## Testing` / `## Glossary` body-section requirement still applies to an external PR. The `<!-- pr-sections: skip -->` marker is the escape hatch, at the cost of putting a framework HTML comment into an upstream PR body. Left as-is deliberately: those sections improve any PR, and the marker is a visible, deliberate opt-out.
 
